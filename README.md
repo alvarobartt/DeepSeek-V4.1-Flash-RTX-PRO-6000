@@ -11,7 +11,24 @@
 
 Validated serving recipes for four and eight GPUs, using the checkpoint's original weights and precision.
 
-Stock vLLM fails before inference with `block_kv == 32 or block_kv == 64`; see the [baseline](8-nvidia-rtx-pro-6000/CHANGELOG.md).
+## 8 x NVIDIA RTX PRO 6000
+
+| Concurrency | Baseline t/s [^8gpu-baseline] | Baseline + DSpark t/s | Current t/s |
+|---:|---:|---:|---:|
+| 1 | **85.0** | Not measured | **85.0** |
+| 4 | **253.2** | Not measured | **253.2** |
+| 8 | **375.4** | Not measured | **375.4** |
+| 16 | **553.1** | Not measured | **553.1** |
+| 32 | **657.4** | Not measured | **657.4** |
+| 64 | **866.2** | Not measured | **866.2** |
+| 128 | **1242.4** | Not measured | **1242.4** |
+| 256 | **1814.1** | Not measured | **1814.1** |
+
+![Accepted ShareGPT c1 throughput](8-nvidia-rtx-pro-6000/throughput.png)
+
+![ShareGPT throughput by concurrency](8-nvidia-rtx-pro-6000/concurrency.png)
+
+See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rtx-pro-6000/CHANGELOG.md).
 
 Run the requirements and full `vllm serve` command in the hardware changelog; each directory also includes a Dockerfile that retains the image's default entrypoint without model or parallelism defaults.
 
@@ -25,3 +42,4 @@ The measured model revision retains a 1,048,576-token context and 1,024 schedule
 
 The recipes target this model, sm120 hardware, and vLLM version; the [Apache 2.0 license](LICENSE) covers this repository, and model weights retain their upstream terms.
 
+[^8gpu-baseline]: Baseline uses sm120 compatibility fixes, FlashInfer 0.7.1, and `--block-size 64`; stock vLLM failed before inference.

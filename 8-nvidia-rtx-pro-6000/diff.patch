@@ -1,0 +1,49 @@
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -369,7 +369,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+ 
+ @dataclass(frozen=True)
+--- a/vllm/models/deepseek_v41/sparse_mla.py
++++ b/vllm/models/deepseek_v41/sparse_mla.py
+@@ -87,7 +87,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+     @staticmethod
+     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -25,6 +25,7 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import (
+@@ -115,7 +116,7 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [128]
++        return [64 if current_platform.is_device_capability_family(120) else 128]
+ 
+     @staticmethod
+     def get_name() -> str:
