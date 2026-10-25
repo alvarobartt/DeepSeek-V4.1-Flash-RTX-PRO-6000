@@ -209,6 +209,18 @@
  
  
  @dataclass(frozen=True)
+@@ -932,7 +936,10 @@
+ def _supports_varlen_paged_mqa_logits() -> bool:
+     return (
+         current_platform.is_cuda()
+-        and current_platform.is_device_capability_family(100)
++        and (
++            current_platform.is_device_capability_family(100)
++            or current_platform.is_device_capability_family(120)
++        )
+         and has_deep_gemm()
+     )
+ 
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -41,6 +41,7 @@
