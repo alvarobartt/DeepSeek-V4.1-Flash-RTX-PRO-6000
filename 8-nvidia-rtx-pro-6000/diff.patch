@@ -1,226 +1,49 @@
---- a/vllm/models/deepseek_v41/compressor.py
-+++ b/vllm/models/deepseek_v41/compressor.py
-@@ -24,6 +24,7 @@
-     AttentionMetadataBuilder,
-     CommonAttentionMetadata,
-     MultipleOf,
-+    max_decode_query_len,
- )
- from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
- 
-@@ -85,7 +86,17 @@
- 
- 
- class CompressorMetadataBuilder(AttentionMetadataBuilder):
--    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
-+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+--- /dev/null
++++ b/vllm/distributed/nccl_tuner.cc
+@@ -0,0 +1,43 @@
++#include <cmath>
++#include <cstdlib>
++#include "nccl_tuner.h"
 +
-+    @classmethod
-+    def get_varlen_cudagraph_max_query_len(
-+        cls,
-+        vllm_config: VllmConfig,
-+        kv_cache_spec: KVCacheSpec,
-+    ) -> int | None:
-+        # Decode replays use device request boundaries; prefill metadata is
-+        # not graph-safe.
-+        return max_decode_query_len(vllm_config)
- 
-     def __init__(self, *args, **kwargs):
-         super().__init__(*args, **kwargs)
---- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
-+++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
-@@ -25,17 +25,20 @@
-     DeepseekV4SparseMLAMetadataBuilder,
-     DeepseekV41SparseSWAMetadataBuilder,
- )
-+from vllm.platforms import current_platform
- from vllm.platforms.interface import DeviceCapability
- from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
- from vllm.v1.attention.backend import (
-     AttentionCGSupport,
-     CommonAttentionMetadata,
-     MultipleOf,
-+    max_decode_query_len,
- )
- from vllm.v1.attention.backends.mla.compressor_utils import (
-     get_dspark_swa_index_width,
- )
- from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
-+from vllm.v1.kv_cache_interface import KVCacheSpec
- 
- if TYPE_CHECKING:
-     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
-@@ -115,7 +118,7 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [128]
-+        return [64 if current_platform.is_device_capability_family(120) else 128]
- 
-     @staticmethod
-     def get_name() -> str:
-@@ -178,15 +181,35 @@
- 
- 
- class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
--    """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
--
--    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
-+    """Varlen-decode-capable metadata builder for the FlashInfer sparse MLA backend."""
++struct Context {
++    bool enabled;
++};
 +
-+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++static ncclResult_t init(size_t ranks, size_t nodes, ncclDebugLogger_t log, void** context) {
++    auto* state = static_cast<Context*>(std::malloc(sizeof(Context)));
++    if (state == nullptr) return ncclSystemError;
++    state->enabled = ranks == 8 && nodes == 1;
++    *context = state;
++    if (state->enabled && log != nullptr) {
++        log(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__, "TUNER/sm120: small all-reduce Tree policy enabled");
++    }
++    return ncclSuccess;
++}
 +
-+    @classmethod
-+    def get_varlen_cudagraph_max_query_len(
-+        cls,
-+        vllm_config: VllmConfig,
-+        kv_cache_spec: KVCacheSpec,
-+    ) -> int | None:
-+        # Decode replays use device request boundaries; prefill metadata is
-+        # not graph-safe.
-+        return max_decode_query_len(vllm_config)
- 
- 
- class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
- 
--    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
-+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++static ncclResult_t tune(void* context, ncclFunc_t function, size_t bytes, int,
++                        float** costs, int algorithms, int protocols, int, int*) {
++    auto* state = static_cast<Context*>(context);
++    if (state == nullptr || !state->enabled || function != ncclFuncAllReduce ||
++        bytes > 65536 || algorithms <= NCCL_ALGO_TREE || protocols < 1) return ncclSuccess;
++    auto* table = reinterpret_cast<float*>(costs);
++    int best = -1;
++    for (int protocol = 0; protocol < protocols; ++protocol) {
++        int index = NCCL_ALGO_TREE * protocols + protocol;
++        if (table[index] >= 0.0f && std::isfinite(table[index]) &&
++            (best < 0 || table[index] < table[best])) best = index;
++    }
++    if (best >= 0) table[best] = 0.0f;
++    return ncclSuccess;
++}
 +
-+    @classmethod
-+    def get_varlen_cudagraph_max_query_len(
-+        cls,
-+        vllm_config: VllmConfig,
-+        kv_cache_spec: KVCacheSpec,
-+    ) -> int | None:
-+        # Decode replays use device request boundaries; prefill metadata is
-+        # not graph-safe.
-+        return max_decode_query_len(vllm_config)
- 
-     def __init__(self, *args, **kwargs):
-         super().__init__(*args, **kwargs)
---- a/vllm/models/deepseek_v41/nvidia/flashmla.py
-+++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
-@@ -5,6 +5,7 @@
- 
- import torch
- 
-+from vllm.config import VllmConfig
- from vllm.forward_context import get_forward_context
- from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
- from vllm.models.deepseek_v41.attention import DeepseekV4Attention
-@@ -23,12 +24,13 @@
-     DeepseekV41SparseSWAMetadataBuilder,
- )
- from vllm.utils.math_utils import round_up
--from vllm.v1.attention.backend import AttentionCGSupport
-+from vllm.v1.attention.backend import AttentionCGSupport, max_decode_query_len
- from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
- from vllm.v1.attention.ops.flashmla import (
-     flash_mla_sparse_fwd,
-     flash_mla_with_kvcache,
- )
-+from vllm.v1.kv_cache_interface import KVCacheSpec
- from vllm.v1.worker.workspace import current_workspace_manager
- 
- if TYPE_CHECKING:
-@@ -38,7 +40,17 @@
- class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
-     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
- 
--    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
-+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++static ncclResult_t destroy(void* context) {
++    std::free(context);
++    return ncclSuccess;
++}
 +
-+    @classmethod
-+    def get_varlen_cudagraph_max_query_len(
-+        cls,
-+        vllm_config: VllmConfig,
-+        kv_cache_spec: KVCacheSpec,
-+    ) -> int | None:
-+        # Decode replays use device request boundaries; prefill metadata is
-+        # not graph-safe.
-+        return max_decode_query_len(vllm_config)
- 
- 
- class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
---- a/vllm/models/deepseek_v41/sparse_mla.py
-+++ b/vllm/models/deepseek_v41/sparse_mla.py
-@@ -18,6 +18,7 @@
-     AttentionMetadataBuilder,
-     CommonAttentionMetadata,
-     MultipleOf,
-+    max_decode_query_len,
- )
- from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
- from vllm.v1.attention.backends.mla.sparse_swa import (
-@@ -26,7 +27,7 @@
-     _LAYER_TYPE_SWAONLY,
-     DeepseekSparseSWAMetadataBuilder,
- )
--from vllm.v1.kv_cache_interface import AttentionSpec
-+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
- 
- # v4.1 per-layer compress ratios: 0 = pure sliding window, 1 = full-length
- # compressed cache, 2 = ratio-2 compressed cache. Ratio-1 and ratio-2 layers
-@@ -87,7 +88,11 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [64 if current_platform.is_device_capability_family(90) else 128]
-+        small_pages = (
-+            current_platform.is_device_capability_family(90)
-+            or current_platform.is_device_capability_family(120)
-+        )
-+        return [64 if small_pages else 128]
- 
-     @staticmethod
-     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
-@@ -219,7 +224,17 @@
- 
- 
- class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
--    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
-+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
-+
-+    @classmethod
-+    def get_varlen_cudagraph_max_query_len(
-+        cls,
-+        vllm_config: VllmConfig,
-+        kv_cache_spec: KVCacheSpec,
-+    ) -> int | None:
-+        # Decode replays use device request boundaries; prefill metadata is
-+        # not graph-safe.
-+        return max_decode_query_len(vllm_config)
- 
- 
- class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
---- a/vllm/v1/attention/backends/mla/indexer.py
-+++ b/vllm/v1/attention/backends/mla/indexer.py
-@@ -369,7 +369,11 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [64 if current_platform.is_device_capability_family(90) else 128]
-+        small_pages = (
-+            current_platform.is_device_capability_family(90)
-+            or current_platform.is_device_capability_family(120)
-+        )
-+        return [64 if small_pages else 128]
- 
- 
- @dataclass(frozen=True)
-@@ -932,7 +936,10 @@
- def _supports_varlen_paged_mqa_logits() -> bool:
-     return (
-         current_platform.is_cuda()
--        and current_platform.is_device_capability_family(100)
-+        and (
-+            current_platform.is_device_capability_family(100)
-+            or current_platform.is_device_capability_family(120)
-+        )
-         and has_deep_gemm()
-     )
- 
++extern "C" {
++    ncclTuner_v4_t ncclTunerPlugin_v4 = {"sm120-small-allreduce", init, tune, destroy};
++}
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -41,6 +41,7 @@
@@ -435,49 +258,266 @@
  
          if needs_padded_path:
              # if padded, we need to unpack
---- /dev/null
-+++ b/vllm/distributed/nccl_tuner.cc
-@@ -0,0 +1,43 @@
-+#include <cmath>
-+#include <cstdlib>
-+#include "nccl_tuner.h"
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -119,14 +119,14 @@
+     )
+ 
+ 
+-# Which packed fp8_ds_mla record a V4.1 layer writes. FlashMLA decodes
+-# DeepSeek's V4.1 record -- all 512 dims (RoPE included) as fp8 e4m3 with one
+-# UE8M0 scale per 32 dims, 512 data bytes + 16 scale bytes per token, pages
+-# rounded to the kernel's 512 B TMA stride -- only in its SM100 sparse-decode
+-# kernels. Every other arch keeps the V4 record: 448 fp8 NoPE + 64 bf16 RoPE
+-# plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
++# FlashMLA on sm100 and FlashInfer on sm120 read the V4.1 record: all 512
++# dims as fp8 with 16 UE8M0 scales and a 512-byte aligned page stride.
++# Other architectures retain the V4 record with a bf16 RoPE tail.
+ def _use_v41_mxfp8_kv_record() -> bool:
+-    return current_platform.is_device_capability_family(100)
++    return (
++        current_platform.is_device_capability_family(100)
++        or current_platform.is_device_capability_family(120)
++    )
+ 
+ 
+ def _resolve_dsv4_kv_cache_dtype(
+--- a/vllm/models/deepseek_v41/compressor.py
++++ b/vllm/models/deepseek_v41/compressor.py
+@@ -24,6 +24,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
+ 
+@@ -85,7 +86,17 @@
+ 
+ 
+ class CompressorMetadataBuilder(AttentionMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 +
-+struct Context {
-+    bool enabled;
-+};
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -25,17 +25,20 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import (
+     get_dspark_swa_index_width,
+ )
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+@@ -115,7 +118,7 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [128]
++        return [64 if current_platform.is_device_capability_family(120) else 128]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -178,15 +181,35 @@
+ 
+ 
+ class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
+-
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    """Varlen-decode-capable metadata builder for the FlashInfer sparse MLA backend."""
 +
-+static ncclResult_t init(size_t ranks, size_t nodes, ncclDebugLogger_t log, void** context) {
-+    auto* state = static_cast<Context*>(std::malloc(sizeof(Context)));
-+    if (state == nullptr) return ncclSystemError;
-+    state->enabled = ranks == 8 && nodes == 1;
-+    *context = state;
-+    if (state->enabled && log != nullptr) {
-+        log(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__, "TUNER/sm120: small all-reduce Tree policy enabled");
-+    }
-+    return ncclSuccess;
-+}
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 +
-+static ncclResult_t tune(void* context, ncclFunc_t function, size_t bytes, int,
-+                        float** costs, int algorithms, int protocols, int, int*) {
-+    auto* state = static_cast<Context*>(context);
-+    if (state == nullptr || !state->enabled || function != ncclFuncAllReduce ||
-+        bytes > 65536 || algorithms <= NCCL_ALGO_TREE || protocols < 1) return ncclSuccess;
-+    auto* table = reinterpret_cast<float*>(costs);
-+    int best = -1;
-+    for (int protocol = 0; protocol < protocols; ++protocol) {
-+        int index = NCCL_ALGO_TREE * protocols + protocol;
-+        if (table[index] >= 0.0f && std::isfinite(table[index]) &&
-+            (best < 0 || table[index] < table[best])) best = index;
-+    }
-+    if (best >= 0) table[best] = 0.0f;
-+    return ncclSuccess;
-+}
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 +
-+static ncclResult_t destroy(void* context) {
-+    std::free(context);
-+    return ncclSuccess;
-+}
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -834,6 +857,7 @@
+             bmm1_scale=self.scale,
+             sinks=self.attn_sink,
+             kv_layout="NHD",
++            kv_cache_format="fp8_dsv41",
+             swa_topk_lens=swa_lens,
+             extra_sparse_indices=extra_sparse_indices,
+             extra_sparse_topk_lens=extra_sparse_lengths,
+@@ -949,6 +973,7 @@
+                 bmm1_scale=self.scale,
+                 sinks=self.attn_sink,
+                 kv_layout="NHD",
++                kv_cache_format="fp8_dsv41",
+                 swa_topk_lens=swa_lens_chunk,
+                 extra_sparse_indices=extra_sparse_indices_chunk,
+                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+--- a/vllm/models/deepseek_v41/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
+@@ -5,6 +5,7 @@
+ 
+ import torch
+ 
++from vllm.config import VllmConfig
+ from vllm.forward_context import get_forward_context
+ from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
+ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+@@ -23,12 +24,13 @@
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
+ from vllm.utils.math_utils import round_up
+-from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backend import AttentionCGSupport, max_decode_query_len
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+ from vllm.v1.attention.ops.flashmla import (
+     flash_mla_sparse_fwd,
+     flash_mla_with_kvcache,
+ )
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -38,7 +40,17 @@
+ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 +
-+extern "C" {
-+    ncclTuner_v4_t ncclTunerPlugin_v4 = {"sm120-small-allreduce", init, tune, destroy};
-+}
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+--- a/vllm/models/deepseek_v41/sparse_mla.py
++++ b/vllm/models/deepseek_v41/sparse_mla.py
+@@ -18,6 +18,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+ from vllm.v1.attention.backends.mla.sparse_swa import (
+@@ -26,7 +27,7 @@
+     _LAYER_TYPE_SWAONLY,
+     DeepseekSparseSWAMetadataBuilder,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ 
+ # v4.1 per-layer compress ratios: 0 = pure sliding window, 1 = full-length
+ # compressed cache, 2 = ratio-2 compressed cache. Ratio-1 and ratio-2 layers
+@@ -87,7 +88,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+     @staticmethod
+     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+@@ -219,7 +224,17 @@
+ 
+ 
+ class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -369,7 +369,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+ 
+ @dataclass(frozen=True)
+@@ -932,7 +936,10 @@
+ def _supports_varlen_paged_mqa_logits() -> bool:
+     return (
+         current_platform.is_cuda()
+-        and current_platform.is_device_capability_family(100)
++        and (
++            current_platform.is_device_capability_family(100)
++            or current_platform.is_device_capability_family(120)
++        )
+         and has_deep_gemm()
+     )
+ 
