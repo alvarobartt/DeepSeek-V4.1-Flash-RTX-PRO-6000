@@ -231,7 +231,7 @@
      has_deep_gemm,
  )
  from vllm.utils.import_utils import has_cutedsl
-@@ -806,84 +807,120 @@
+@@ -806,84 +807,127 @@
              if use_fp4_cache
              else padded_q_quant_decode_tokens
          )
@@ -274,7 +274,14 @@
 -            decode_candidates = candidate_blocks[:num_rows]
 -            if candidate_write:
 -                _select_candidate_blocks(
-+        bounded_decode = candidate_blocks is not None and current_platform.is_cuda()
++        bounded_decode = current_platform.is_cuda() and (
++            candidate_blocks is not None
++            or (
++                current_platform.is_device_capability_family(120)
++                and not use_pcp
++                and dcp_world_size == 1
++            )
++        )
 +        logits_max_len = max_model_len
 +        requests_per_chunk = batch_size
 +        if bounded_decode:
