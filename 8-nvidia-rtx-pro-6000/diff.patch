@@ -1,3 +1,199 @@
+--- a/vllm/models/deepseek_v41/compressor.py
++++ b/vllm/models/deepseek_v41/compressor.py
+@@ -24,6 +24,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
+ 
+@@ -85,7 +86,17 @@
+ 
+ 
+ class CompressorMetadataBuilder(AttentionMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -25,17 +25,20 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import (
+     get_dspark_swa_index_width,
+ )
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+@@ -115,7 +118,7 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [128]
++        return [64 if current_platform.is_device_capability_family(120) else 128]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -178,15 +181,35 @@
+ 
+ 
+ class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
+-
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    """Varlen-decode-capable metadata builder for the FlashInfer sparse MLA backend."""
++
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+--- a/vllm/models/deepseek_v41/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
+@@ -5,6 +5,7 @@
+ 
+ import torch
+ 
++from vllm.config import VllmConfig
+ from vllm.forward_context import get_forward_context
+ from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
+ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+@@ -23,12 +24,13 @@
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
+ from vllm.utils.math_utils import round_up
+-from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backend import AttentionCGSupport, max_decode_query_len
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+ from vllm.v1.attention.ops.flashmla import (
+     flash_mla_sparse_fwd,
+     flash_mla_with_kvcache,
+ )
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -38,7 +40,17 @@
+ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+--- a/vllm/models/deepseek_v41/sparse_mla.py
++++ b/vllm/models/deepseek_v41/sparse_mla.py
+@@ -18,6 +18,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+ from vllm.v1.attention.backends.mla.sparse_swa import (
+@@ -26,7 +27,7 @@
+     _LAYER_TYPE_SWAONLY,
+     DeepseekSparseSWAMetadataBuilder,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ 
+ # v4.1 per-layer compress ratios: 0 = pure sliding window, 1 = full-length
+ # compressed cache, 2 = ratio-2 compressed cache. Ratio-1 and ratio-2 layers
+@@ -87,7 +88,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+     @staticmethod
+     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+@@ -219,7 +224,17 @@
+ 
+ 
+ class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
 @@ -369,7 +369,11 @@
@@ -13,37 +209,210 @@
  
  
  @dataclass(frozen=True)
---- a/vllm/models/deepseek_v41/sparse_mla.py
-+++ b/vllm/models/deepseek_v41/sparse_mla.py
-@@ -87,7 +87,11 @@
- 
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [64 if current_platform.is_device_capability_family(90) else 128]
-+        small_pages = (
-+            current_platform.is_device_capability_family(90)
-+            or current_platform.is_device_capability_family(120)
-+        )
-+        return [64 if small_pages else 128]
- 
-     @staticmethod
-     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
---- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
-+++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
-@@ -25,6 +25,7 @@
-     DeepseekV4SparseMLAMetadataBuilder,
-     DeepseekV41SparseSWAMetadataBuilder,
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -41,6 +41,7 @@
+ from vllm.utils.deep_gemm import (
+     fp8_fp4_mqa_logits,
+     fp8_fp4_paged_mqa_logits,
++    get_paged_mqa_logits_metadata,
+     has_deep_gemm,
  )
-+from vllm.platforms import current_platform
- from vllm.platforms.interface import DeviceCapability
- from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
- from vllm.v1.attention.backend import (
-@@ -115,7 +116,7 @@
+ from vllm.utils.import_utils import has_cutedsl
+@@ -806,84 +807,120 @@
+             if use_fp4_cache
+             else padded_q_quant_decode_tokens
+         )
+-        if current_platform.is_xpu():
+-            if padded_q_scale is not None:
+-                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
+-            seq_lens_xpu = (
+-                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+-            )
+-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+-                padded_q_quant_cast,
+-                kv_cache,
+-                weights[:num_padded_tokens],
+-                seq_lens_xpu,
+-                decode_metadata.block_table,
+-                decode_metadata.schedule_metadata,
+-                max_model_len,
+-            )
+-        else:
+-            logits = fp8_fp4_paged_mqa_logits(
+-                (padded_q_quant_cast, padded_q_scale),
+-                kv_cache,
+-                weights[:num_padded_tokens],
+-                seq_lens,
+-                decode_metadata.block_table,
+-                decode_metadata.schedule_metadata,
+-                max_model_len=max_model_len,
+-                clean_logits=False,
+-                indices=decode_metadata.indices,
+-            )
+-        num_rows = logits.shape[0]
+-        if candidate_blocks is not None:
+-            # Two-level selection (v4.1) on the decode logits; columns are
+-            # request-local compressed positions. seq_lens is (B, next_n)
+-            # for native spec decode (per-row effective lens) and (B, 1)
+-            # otherwise.
+-            vis = seq_lens.reshape(-1)
+-            row_repeat = next_n if vis.numel() != num_rows else 1
+-            vis = vis[:num_rows]
+-            decode_candidates = candidate_blocks[:num_rows]
+-            if candidate_write:
+-                _select_candidate_blocks(
++        bounded_decode = candidate_blocks is not None and current_platform.is_cuda()
++        logits_max_len = max_model_len
++        requests_per_chunk = batch_size
++        if bounded_decode:
++            if (
++                forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
++                and not torch.cuda.is_current_stream_capturing()
++            ):
++                logits_max_len = min(
++                    max_model_len, max(topk_tokens, attn_metadata_narrowed.max_seq_len)
++                )
++            logits_stride = ((logits_max_len + 255) // 256) * 256
++            budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            requests_per_chunk = max(1, budget // (next_n * logits_stride * 4))
++
++        for request_start in range(0, batch_size, requests_per_chunk):
++            request_end = min(batch_size, request_start + requests_per_chunk)
++            row_start, row_end = request_start * next_n, request_end * next_n
++            chunk_seq_lens = seq_lens[request_start:request_end]
++            chunk_indices = (
++                decode_metadata.indices[request_start:request_end]
++                if decode_metadata.indices is not None
++                else None
++            )
++            schedule_metadata = decode_metadata.schedule_metadata
++            if requests_per_chunk < batch_size:
++                schedule_metadata = get_paged_mqa_logits_metadata(
++                    chunk_seq_lens,
++                    kv_cache.shape[1],
++                    schedule_metadata.shape[0] - 1,
++                    indices=chunk_indices,
++                )
++            chunk_q = padded_q_quant_cast[request_start:request_end]
++            chunk_q_scale = (
++                padded_q_scale[request_start:request_end]
++                if padded_q_scale is not None
++                else None
++            )
++            chunk_block_table = decode_metadata.block_table[request_start:request_end]
++            if current_platform.is_xpu():
++                if chunk_q_scale is not None:
++                    raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
++                seq_lens_xpu = (
++                    chunk_seq_lens[:, -1].contiguous()
++                    if chunk_seq_lens.ndim == 2
++                    else chunk_seq_lens
++                )
++                logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
++                    chunk_q,
++                    kv_cache,
++                    weights[row_start:row_end],
++                    seq_lens_xpu,
++                    chunk_block_table,
++                    schedule_metadata,
++                    logits_max_len,
++                )
++            else:
++                logits = fp8_fp4_paged_mqa_logits(
++                    (chunk_q, chunk_q_scale),
++                    kv_cache,
++                    weights[row_start:row_end],
++                    chunk_seq_lens,
++                    chunk_block_table,
++                    schedule_metadata,
++                    max_model_len=logits_max_len,
++                    clean_logits=False,
++                    indices=chunk_indices,
++                )
++            num_rows = logits.shape[0]
++            if candidate_blocks is not None:
++                vis = chunk_seq_lens.reshape(-1)
++                row_repeat = next_n if vis.numel() != num_rows else 1
++                vis = vis[:num_rows]
++                decode_candidates = candidate_blocks[row_start:row_end]
++                if candidate_write:
++                    _select_candidate_blocks(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates.shape[1],
++                        candidate_block_size,
++                        decode_candidates,
++                        row_repeat,
++                    )
++                else:
++                    _apply_candidate_mask(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates,
++                        candidate_block_size,
++                        row_repeat,
++                    )
++            chunk_topk = topk_indices_buffer[row_start:row_end, :topk_tokens]
++            get_indexer_topk(topk_backend)(
++                logits,
++                chunk_seq_lens,
++                next_n,
++                chunk_topk,
++                topk_tokens,
++                attn_metadata_narrowed.max_seq_len,
++            )
++            if decode_metadata.global_seq_lens is not None:
++                _merge_dcp_topk_global(
+                     logits,
+-                    None,
+-                    vis,
+-                    decode_candidates.shape[1],
+-                    candidate_block_size,
+-                    decode_candidates,
+-                    row_repeat,
+-                )
+-            else:
+-                _apply_candidate_mask(
+-                    logits,
+-                    None,
+-                    vis,
+-                    decode_candidates,
+-                    candidate_block_size,
+-                    row_repeat,
+-                )
++                    chunk_topk,
++                    topk_tokens,
++                    dcp_rank,
++                    dcp_world_size,
++                    cp_kv_cache_interleave_size,
++                )
++            del logits
++
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+-
+-        # The backend comes from the layer (config is only readable at model
+-        # construction); dispatchers are cached per backend.
+-        get_indexer_topk(topk_backend)(
+-            logits,
+-            seq_lens,
+-            next_n,
+-            topk_indices,
+-            topk_tokens,
+-            attn_metadata_narrowed.max_seq_len,
+-        )
+-
+-        if decode_metadata.global_seq_lens is not None:
+-            _merge_dcp_topk_global(
+-                logits,
+-                topk_indices,
+-                topk_tokens,
+-                dcp_rank,
+-                dcp_world_size,
+-                cp_kv_cache_interleave_size,
+-            )
  
-     @staticmethod
-     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
--        return [128]
-+        return [64 if current_platform.is_device_capability_family(120) else 128]
- 
-     @staticmethod
-     def get_name() -> str:
+         if needs_padded_path:
+             # if padded, we need to unpack

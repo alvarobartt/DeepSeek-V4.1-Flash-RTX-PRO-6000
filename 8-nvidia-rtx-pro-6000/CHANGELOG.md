@@ -4,11 +4,11 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 1. sm120 support
+## 2. DSpark decoding
 
-- Upgrade the bundled FlashInfer Python, cubin, and sm120 cache packages from 0.7.0.post1 to 0.7.1 because the older version lacks runtime page-size support.
-- Both diff.patch and `--block-size 64` are required because the patch enables 64-token pages in the sm120 backends and the flag selects them instead of the 128-token pages DeepGEMM rejects.
--    --mm-encoder-tp-mode data
+- Enable the checkpoint's five-token DSpark draft so the target model can verify several tokens in one pass.
+- Bound indexer logits to the profiled 512 MiB budget because the original allocation failed with CUDA OOM at concurrency 256.
+-    --block-size 64
 
 Requirements, on a fresh vLLM image:
 
@@ -31,22 +31,24 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v41 \
     --mm-encoder-tp-mode data \
-    --block-size 64
+    --block-size 64 \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170"}'
 ```
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 85.0 | 128.5 | 11.49 |
-| 4 | 128 | 253.2 | 93.9 | 15.64 |
-| 8 | 128 | 375.4 | 215.1 | 20.46 |
-| 16 | 128 | 553.1 | 287.9 | 25.91 |
-| 32 | 128 | 657.4 | 4198.5 | 40.74 |
-| 64 | 128 | 866.2 | 831.4 | 71.84 |
-| 128 | 256 | 1242.4 | 1582.8 | 97.01 |
-| 256 | 512 | 1814.1 | 2901.4 | 181.96 |
+| 1 | 128 | 159.2 | 136.6 | 8.17 |
+| 4 | 128 | 380.4 | 134.1 | 13.32 |
+| 8 | 128 | 496.2 | 223.9 | 20.79 |
+| 16 | 128 | 650.5 | 283.8 | 30.43 |
+| 32 | 128 | 954.1 | 434.3 | 38.53 |
+| 64 | 128 | 1185.0 | 903.5 | 65.98 |
+| 128 | 256 | 1471.9 | 1508.4 | 93.65 |
+| 256 | 512 | 1726.3 | 3355.1 | 170.67 |
 
 ## Accepted progress
 
 | Stage | Change | c1 t/s | Revision |
 |---:|---|---:|---|
-| 1 | sm120 support | 85.0 | This revision |
+| 1 | sm120 support | 85.0 | [`0cd46b2`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/0cd46b25086a61436eb0979abf115f66442e889e) |
+| 2 | DSpark decoding | 159.2 | This revision |
