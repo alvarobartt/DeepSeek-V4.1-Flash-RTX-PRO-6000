@@ -1,3 +1,258 @@
+diff --git a/vllm/distributed/device_communicators/cuda_communicator.py b/vllm/distributed/device_communicators/cuda_communicator.py
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -112,6 +112,12 @@
+             if is_symmetric_memory_enabled():
+                 register_nccl_symmetric_ops(self.pynccl_comm)
+ 
++        self.sm120_host_ar_comm = None
++        if unique_name.split(":")[0] == "tp" and self.world_size == 8:
++            from .sm120_host_all_reduce import Sm120HostAllReduce
++
++            self.sm120_host_ar_comm = Sm120HostAllReduce(self.cpu_group, self.device)
++
+         self.ca_comm: CustomAllreduce | None = None
+         self.qr_comm: QuickAllReduce | None = None
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+@@ -294,6 +300,7 @@
+         depends on the input tensor.
+         """
+         all_potential_ar_backends = [
++            "SM120_HOST_LL",
+             "FLASHINFER_PCIE_IPC",
+             "FLASHINFER",
+             "NCCL_SYMM_MEM",
+@@ -304,6 +311,8 @@
+             "PYNCCL",
+         ]
+         enabled_ar_backends: list[str] = []
++        if self.sm120_host_ar_comm is not None and not self.sm120_host_ar_comm.disabled:
++            enabled_ar_backends.append("SM120_HOST_LL")
+         if (
+             self.fi_pcie_ipc_ar_comm is not None
+             and not self.fi_pcie_ipc_ar_comm.disabled
+@@ -360,6 +369,9 @@
+         )
+ 
+     def all_reduce(self, input_):
++        host_ar = self.sm120_host_ar_comm
++        if host_ar is not None and host_ar.should_use(input_):
++            return host_ar.all_reduce(input_)
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -804,6 +816,9 @@
+             raise ValueError("No PyNCCL communicator found")
+ 
+     def destroy(self):
++        if self.sm120_host_ar_comm is not None:
++            self.sm120_host_ar_comm.destroy()
++            self.sm120_host_ar_comm = None
+         if self.pynccl_comm is not None:
+             self.pynccl_comm.destroy()
+             self.pynccl_comm = None
+diff --git a/vllm/distributed/device_communicators/sm120_host_all_reduce.cu b/vllm/distributed/device_communicators/sm120_host_all_reduce.cu
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.cu
+@@ -0,0 +1,90 @@
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++__global__ void publish_host(const uint32_t* input, uint64_t* shared,
++                             uint32_t* counter, int words, int stride, int rank) {
++    __shared__ uint32_t epoch;
++    if (threadIdx.x == 0) epoch = atomicAdd(counter, 1u) + 1u;
++    __syncthreads();
++    uint64_t* slot = shared + size_t(epoch & 1u) * 8 * stride;
++    for (int i = threadIdx.x; i < words; i += blockDim.x) {
++        uint64_t packet = (uint64_t(epoch) << 32) | input[i];
++        uint64_t* address = slot + size_t(rank) * stride + i;
++        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(packet) : "memory");
++    }
++    __threadfence_system();
++}
++
++__global__ void reduce_host(const uint32_t* input, uint32_t* output,
++                            uint64_t* shared, const uint32_t* counter, int* error,
++                            int words, int stride, int rank) {
++    if (*error) return;
++    const uint32_t epoch = *counter;
++    uint64_t* slot = shared + size_t(epoch & 1u) * 8 * stride;
++    const uint64_t deadline = clock64() + 5000000000ull;
++    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
++         i += blockDim.x * gridDim.x) {
++        float x = 0.0f, y = 0.0f;
++        #pragma unroll
++        for (int peer = 0; peer < 8; ++peer) {
++            uint32_t value;
++            if (peer == rank) value = input[i];
++            else {
++                const uint64_t* address = slot + size_t(peer) * stride + i;
++                uint64_t packet;
++                do {
++                    asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(packet) : "l"(address) : "memory");
++                    if (uint32_t(packet >> 32) != epoch && clock64() > deadline) {
++                        if (atomicCAS(error, 0, peer + 1) == 0) {
++                            error[1] = i; error[2] = uint32_t(packet);
++                            error[3] = uint32_t(packet >> 32); error[4] = epoch;
++                        }
++                        asm volatile("trap;");
++                        return;
++                    }
++                } while (uint32_t(packet >> 32) != epoch);
++                value = uint32_t(packet);
++            }
++            __nv_bfloat162 bf;
++            *reinterpret_cast<uint32_t*>(&bf) = value;
++            float2 pair = __bfloat1622float2(bf);
++            x += pair.x;
++            y += pair.y;
++        }
++        __nv_bfloat162 result = __floats2bfloat162_rn(x, y);
++        output[i] = *reinterpret_cast<uint32_t*>(&result);
++    }
++}
++
++extern "C" int register_host(void* host, size_t bytes, int device, void** mapped) {
++    cudaError_t e = cudaSetDevice(device);
++    if (e != cudaSuccess) return e;
++    e = cudaHostRegister(host, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
++    if (e != cudaSuccess) return e;
++    return cudaHostGetDevicePointer(mapped, host, 0);
++}
++extern "C" int unregister_host(void* host) { return cudaHostUnregister(host); }
++extern "C" const char* error_text(int code) { return cudaGetErrorString(cudaError_t(code)); }
++extern "C" int launch_host_ll(void* input, void* output, void* shared,
++                              void* counter, void* error, int words, int stride,
++                              int rank, int threads, void* stream) {
++    auto s = reinterpret_cast<cudaStream_t>(stream);
++    publish_host<<<1, 1024, 0, s>>>(static_cast<uint32_t*>(input),
++        static_cast<uint64_t*>(shared), static_cast<uint32_t*>(counter), words, stride, rank);
++    cudaError_t result = cudaGetLastError();
++    if (result != cudaSuccess) return result;
++    int blocks = (words + threads - 1) / threads;
++    reduce_host<<<blocks ? blocks : 1, threads, 0, s>>>(
++        static_cast<uint32_t*>(input), static_cast<uint32_t*>(output),
++        static_cast<uint64_t*>(shared), static_cast<uint32_t*>(counter),
++        static_cast<int*>(error), words, stride, rank);
++    return cudaGetLastError();
++}
++
++extern "C" int prepare_kernel() {
++    cudaFuncAttributes a;
++    cudaError_t e = cudaFuncGetAttributes(&a, publish_host);
++    if (e != cudaSuccess) return e;
++    return cudaFuncGetAttributes(&a, reduce_host);
++}
+diff --git a/vllm/distributed/device_communicators/sm120_host_all_reduce.py b/vllm/distributed/device_communicators/sm120_host_all_reduce.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.py
+@@ -0,0 +1,100 @@
++import ctypes
++import mmap
++import os
++import uuid
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.platforms import current_platform
++
++
++class Sm120HostAllReduce:
++    def __init__(self, group, device):
++        self.disabled = True
++        self.mapping = None
++        self.device = torch.device(device)
++        self.rank = dist.get_rank(group)
++        library = '/usr/local/lib/libvllm-sm120-host-ll.so'
++        if dist.get_world_size(group) != 8 or not os.path.isfile(library):
++            return
++        if not current_platform.is_device_capability_family(120):
++            return
++        if not all(in_the_same_node_as(group, source_rank=0)):
++            return
++        self.lib = ctypes.CDLL(library)
++        self.lib.register_host.argtypes = [
++            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
++            ctypes.POINTER(ctypes.c_void_p),
++        ]
++        self.lib.register_host.restype = ctypes.c_int
++        self.lib.unregister_host.argtypes = [ctypes.c_void_p]
++        self.lib.error_text.argtypes = [ctypes.c_int]
++        self.lib.error_text.restype = ctypes.c_char_p
++        self.lib.prepare_kernel.restype = ctypes.c_int
++        self.lib.launch_host_ll.argtypes = (
++            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
++        )
++        self.lib.launch_host_ll.restype = ctypes.c_int
++        self.stride = 10240
++        size = 2 * 8 * self.stride * 8
++        paths = ['/dev/shm/vllm-sm120-' + uuid.uuid4().hex if self.rank == 0 else None]
++        dist.broadcast_object_list(paths, src=dist.get_process_group_ranks(group)[0], group=group)
++        path = paths[0]
++        if self.rank == 0:
++            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
++            os.ftruncate(fd, size)
++        dist.barrier(group=group)
++        if self.rank != 0:
++            fd = os.open(path, os.O_RDWR)
++        try:
++            self.mapping = mmap.mmap(fd, size, flags=mmap.MAP_SHARED)
++        finally:
++            os.close(fd)
++        for slot in range(2):
++            offset = (slot * 8 + self.rank) * self.stride * 8
++            self.mapping[offset:offset + self.stride * 8] = bytes(self.stride * 8)
++        dist.barrier(group=group)
++        self.host = ctypes.addressof(ctypes.c_char.from_buffer(self.mapping))
++        self.mapped = ctypes.c_void_p()
++        self.check(self.lib.register_host(self.host, size, self.device.index, ctypes.byref(self.mapped)))
++        dist.barrier(group=group)
++        if self.rank == 0:
++            os.unlink(path)
++        self.counter = torch.zeros(1, device=self.device, dtype=torch.int32)
++        self.errors = torch.zeros(8, device=self.device, dtype=torch.int32)
++        self.check(self.lib.prepare_kernel())
++        self.disabled = False
++
++    def check(self, code):
++        if code:
++            raise RuntimeError(self.lib.error_text(code).decode())
++
++    def should_use(self, tensor):
++        return (
++            not self.disabled
++            and tensor.device == self.device
++            and tensor.dtype == torch.bfloat16
++            and tensor.is_contiguous()
++            and tensor.ndim == 2
++            and tensor.shape[-1] == 5120
++            and 1 <= tensor.shape[0] <= 4
++        )
++
++    def all_reduce(self, tensor):
++        output = torch.empty_like(tensor)
++        self.check(self.lib.launch_host_ll(
++            tensor.data_ptr(), output.data_ptr(), self.mapped.value,
++            self.counter.data_ptr(), self.errors.data_ptr(), tensor.numel() // 2,
++            self.stride, self.rank, 128, torch.cuda.current_stream().cuda_stream,
++        ))
++        return output
++
++    def destroy(self):
++        if self.mapping is not None:
++            torch.cuda.synchronize(self.device)
++            self.check(self.lib.unregister_host(self.host))
++            self.mapping.close()
++            self.mapping = None
++        self.disabled = True
+diff --git a/vllm/distributed/nccl_tuner.cc b/vllm/distributed/nccl_tuner.cc
+new file mode 100644
 --- /dev/null
 +++ b/vllm/distributed/nccl_tuner.cc
 @@ -0,0 +1,43 @@
@@ -44,6 +299,249 @@
 +extern "C" {
 +    ncclTuner_v4_t ncclTunerPlugin_v4 = {"sm120-small-allreduce", init, tune, destroy};
 +}
+diff --git a/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py b/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
+--- a/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
++++ b/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
+@@ -136,6 +136,42 @@
+         -float("inf"),
+         (cols < width) & ~(valid & keep),
+     )
++
++
++@triton.jit(do_not_specialize=["width", "nblocks"])
++def _mask_visible_candidates_kernel(
++    logits,
++    starts,
++    ends,
++    flags,
++    stride_row,
++    stride_col,
++    stride_start,
++    stride_end,
++    width,
++    nblocks,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    ROW_REPEAT: tl.constexpr,
++    TILE: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
++    end = tl.minimum(tl.load(ends + row // ROW_REPEAT * stride_end), width)
++    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
++    first = tl.maximum(start, 0) + tl.program_id(1) * TILE
++    step = tl.num_programs(1) * TILE
++    for offset in range(first, end, step):
++        cols = offset + tl.arange(0, TILE)
++        valid = cols < end
++        block = (cols - start) // BLOCK_SIZE
++        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
++        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
++        tl.store(
++            logits + row * stride_row + cols * stride_col,
++            -float("inf"),
++            valid & ~keep,
++        )
+ 
+ 
+ def select_candidate_blocks(
+@@ -196,6 +232,7 @@
+     candidate_blocks: torch.Tensor,
+     block_size: int,
+     row_repeat: int = 1,
++    mask_outside_bounds: bool = True,
+ ) -> None:
+     """Mask packed logits outside causal bounds and request-local candidates."""
+     assert logits.is_cuda
+@@ -218,7 +255,12 @@
+         row_ks is not None,
+         row_repeat,
+     )
+-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
++    tiles = triton.cdiv(width, 1024)
++    kernel = _mask_candidates_kernel
++    if not mask_outside_bounds:
++        kernel = _mask_visible_candidates_kernel
++        tiles = min(tiles, max(16, triton.cdiv(1024, rows)))
++    kernel[(rows, tiles)](
+         logits,
+         row_ks,
+         row_ke,
+diff --git a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+--- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+@@ -465,6 +465,10 @@
+         assert not quant_config.per_out_ch_quant
+ 
+         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
++        self._sm120_small_moe = (
++            current_platform.is_device_capability_family(120)
++            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
++        )
+ 
+     @staticmethod
+     def activation_format() -> mk.FusedMoEActivationFormat:
+@@ -613,6 +617,28 @@
+         assert self.w1_scale is not None
+         assert self.w2_scale is not None
+ 
++        if (
++            self._sm120_small_moe
++            and 0 < hidden_states.size(0) <= 4
++            and hidden_states.dtype == torch.float8_e4m3fn
++            and w1.shape == (48, 4608, 2560)
++            and w2.shape == (48, 5120, 1152)
++            and self.w1_scale.dtype == torch.int32
++            and self.w2_scale.dtype == torch.int32
++            and topk_ids.size(1) == 6
++            and activation == MoEActivation.SILU
++            and not apply_router_weight_on_input
++        ):
++            from vllm.model_executor.layers.fused_moe.experts.sm120_small_moe import (
++                small_moe,
++            )
++
++            small_moe(
++                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                expert_map, a1q_scale, workspace2,
++            )
++            return
++
+         a1q = hidden_states
+         _, N, _ = w1.size()
+         # K comes from activations (full hidden dim), not from w1 which is
+diff --git a/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
+@@ -0,0 +1,126 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _fp8_pair(packed):
++    return tl.inline_asm_elementwise(
++        "cvt.rn.f16x2.e4m3x2 $0, $1;", constraints="=r,h",
++        args=[packed], dtype=tl.int32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _dot_pair(x, packed):
++    return tl.inline_asm_elementwise(
++        "{ .reg .b32 w, p; .reg .b16 lo, hi; .reg .b8 f4, z; .reg .f32 a, b; "
++        "mov.b16 {f4, z}, $2; cvt.rn.f16x2.e2m1x2 w, f4; "
++        "mul.rn.f16x2 p, w, $1; mov.b32 {lo, hi}, p; "
++        "cvt.f32.f16 a, lo; cvt.f32.f16 b, hi; add.f32 $0, a, b; }",
++        constraints="=f,r,h", args=[x, packed.to(tl.uint16)],
++        dtype=tl.float32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _scale(S, row, k, S0: tl.constexpr, S1: tl.constexpr, PACKED: tl.constexpr, LENGTH: tl.constexpr):
++    if PACKED:
++        word = tl.load(S + row * S0 + (k // 512) * S1, k < LENGTH, 0)
++        exponent = (word >> (((k // 128) % 4) * 8)) & 255
++        return (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++    else:
++        return tl.load(S + row * S0 + (k // 128) * S1, k < LENGTH, 0).to(tl.float32)
++
++
++@triton.jit
++def _fc1(X, XS, W, WS, IDS, MAP, Y,
++         K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
++         X0: tl.constexpr, XS0: tl.constexpr, XS1: tl.constexpr,
++         W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
++         S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
++         IDS0: tl.constexpr, IDS1: tl.constexpr,
++         HAS_MAP: tl.constexpr, PACKED_XS: tl.constexpr,
++         BN: tl.constexpr, BK: tl.constexpr):
++    route = tl.program_id(0)
++    token = route // TOPK
++    slot = route % TOPK
++    expert = tl.load(IDS + token * IDS0 + slot * IDS1)
++    if HAS_MAP:
++        expert = tl.load(MAP + expert, expert >= 0, -1)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    gate = tl.full((BN, BK), 0, tl.float32)
++    up = tl.full((BN, BK), 0, tl.float32)
++    if expert >= 0:
++        for block in range(triton.cdiv(K, 2 * BK)):
++            p = block * BK + tl.arange(0, BK)
++            k = 2 * p
++            x = _fp8_pair(tl.load(X + token * X0 + p, k < K, 0))
++            xs = _scale(XS, token, k, XS0, XS1, PACKED_XS, K)
++            a = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
++            b = tl.load(W + expert * W0 + (n[:, None] + I) * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
++            sa = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
++            sb = tl.load(WS + expert * S0 + (n[:, None] + I) * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
++            sa = (sa >> (((k[None, :] // 32) & 3) * 8)) & 255
++            sb = (sb >> (((k[None, :] // 32) & 3) * 8)) & 255
++            sa = (sa.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++            sb = (sb.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++            gate += _dot_pair(x[None, :], a) * (xs[None, :] * sa)
++            up += _dot_pair(x[None, :], b) * (xs[None, :] * sb)
++    g = tl.sum(gate, 1)
++    u = tl.sum(up, 1)
++    tl.store(Y + route * (2 * I) + n, g, n < I)
++    tl.store(Y + route * (2 * I) + I + n, u, n < I)
++
++
++@triton.jit
++def _fc2_reduce(X, XS, W, WS, IDS, MAP, RW, Y,
++                K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
++                XS0: tl.constexpr, XS1: tl.constexpr,
++                W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
++                S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
++                IDS0: tl.constexpr, IDS1: tl.constexpr,
++                RW0: tl.constexpr, RW1: tl.constexpr,
++                HAS_MAP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    token = tl.program_id(0)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    result = tl.full((BN,), 0, tl.float32)
++    for slot in range(TOPK):
++        expert = tl.load(IDS + token * IDS0 + slot * IDS1)
++        if HAS_MAP:
++            expert = tl.load(MAP + expert, expert >= 0, -1)
++        if expert >= 0:
++            total = tl.full((BN, BK), 0, tl.float32)
++            route = token * TOPK + slot
++            for block in range(triton.cdiv(I, 2 * BK)):
++                p = block * BK + tl.arange(0, BK)
++                k = 2 * p
++                x = _fp8_pair(tl.load(X + route * (I // 2) + p, k < I, 0))
++                xs = _scale(XS, route, k, XS0, XS1, True, I)
++                w = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < K) & (k[None, :] < I), 0).to(tl.int32)
++                s = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < K) & (k[None, :] < I), 0)
++                s = (s >> (((k[None, :] // 32) & 3) * 8)) & 255
++                s = (s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++                total += _dot_pair(x[None, :], w) * (xs[None, :] * s)
++            value = tl.sum(total, 1).to(tl.bfloat16).to(tl.float32)
++            weight = tl.load(RW + token * RW0 + slot * RW1)
++            result += value * weight
++    tl.store(Y + token * K + n, result, n < K)
++
++
++def small_moe(experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace, bn=4, bk=256):
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    m, k = x.shape
++    intermediate = w1.shape[1] // 2
++    topk = ids.shape[1]
++    projections = workspace.reshape(-1)[:m * topk * 2 * intermediate].view(m * topk, 2 * intermediate)
++    _fc1[(m * topk, triton.cdiv(intermediate, bn))](
++        x.view(torch.uint16), x_scale, w1, experts.w1_scale, ids, expert_map, projections,
++        k, intermediate, topk, x.stride(0) // 2, *x_scale.stride(),
++        *w1.stride(), *experts.w1_scale.stride(), *ids.stride(),
++        expert_map is not None, x_scale.dtype == torch.int32, bn, bk, num_warps=4, enable_fp_fusion=False)
++    quantized = torch.empty((m * topk, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    _fc2_reduce[(m, triton.cdiv(k, bn))](
++        q.view(torch.uint16), scale, w2, experts.w2_scale, ids, expert_map, weights, output,
++        k, intermediate, topk, *scale.stride(), *w2.stride(), *experts.w2_scale.stride(),
++        *ids.stride(), *weights.stride(), expert_map is not None, bn, bk,
++        num_warps=4, enable_fp_fusion=False)
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -41,6 +41,7 @@
@@ -261,6 +759,7 @@
  
          if needs_padded_path:
              # if padded, we need to unpack
+diff --git a/vllm/models/deepseek_v41/attention.py b/vllm/models/deepseek_v41/attention.py
 --- a/vllm/models/deepseek_v41/attention.py
 +++ b/vllm/models/deepseek_v41/attention.py
 @@ -119,14 +119,14 @@
@@ -285,6 +784,7 @@
  
  
  def _resolve_dsv4_kv_cache_dtype(
+diff --git a/vllm/models/deepseek_v41/compressor.py b/vllm/models/deepseek_v41/compressor.py
 --- a/vllm/models/deepseek_v41/compressor.py
 +++ b/vllm/models/deepseek_v41/compressor.py
 @@ -24,6 +24,7 @@
@@ -314,6 +814,7 @@
  
      def __init__(self, *args, **kwargs):
          super().__init__(*args, **kwargs)
+diff --git a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
 --- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
 +++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
 @@ -25,17 +25,20 @@
@@ -402,6 +903,7 @@
                  swa_topk_lens=swa_lens_chunk,
                  extra_sparse_indices=extra_sparse_indices_chunk,
                  extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+diff --git a/vllm/models/deepseek_v41/nvidia/flashmla.py b/vllm/models/deepseek_v41/nvidia/flashmla.py
 --- a/vllm/models/deepseek_v41/nvidia/flashmla.py
 +++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
 @@ -5,6 +5,7 @@
@@ -446,6 +948,7 @@
  
  
  class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+diff --git a/vllm/models/deepseek_v41/sparse_mla.py b/vllm/models/deepseek_v41/sparse_mla.py
 --- a/vllm/models/deepseek_v41/sparse_mla.py
 +++ b/vllm/models/deepseek_v41/sparse_mla.py
 @@ -18,6 +18,7 @@
@@ -497,6 +1000,7 @@
  
  
  class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
+diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
 @@ -369,7 +369,11 @@
@@ -524,241 +1028,3 @@
          and has_deep_gemm()
      )
  
---- a/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
-+++ b/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
-@@ -136,6 +136,42 @@
-         -float("inf"),
-         (cols < width) & ~(valid & keep),
-     )
-+
-+
-+@triton.jit(do_not_specialize=["width", "nblocks"])
-+def _mask_visible_candidates_kernel(
-+    logits,
-+    starts,
-+    ends,
-+    flags,
-+    stride_row,
-+    stride_col,
-+    stride_start,
-+    stride_end,
-+    width,
-+    nblocks,
-+    BLOCK_SIZE: tl.constexpr,
-+    HAS_STARTS: tl.constexpr,
-+    ROW_REPEAT: tl.constexpr,
-+    TILE: tl.constexpr,
-+):
-+    row = tl.program_id(0).to(tl.int64)
-+    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
-+    end = tl.minimum(tl.load(ends + row // ROW_REPEAT * stride_end), width)
-+    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
-+    first = tl.maximum(start, 0) + tl.program_id(1) * TILE
-+    step = tl.num_programs(1) * TILE
-+    for offset in range(first, end, step):
-+        cols = offset + tl.arange(0, TILE)
-+        valid = cols < end
-+        block = (cols - start) // BLOCK_SIZE
-+        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
-+        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
-+        tl.store(
-+            logits + row * stride_row + cols * stride_col,
-+            -float("inf"),
-+            valid & ~keep,
-+        )
- 
- 
- def select_candidate_blocks(
-@@ -196,6 +232,7 @@
-     candidate_blocks: torch.Tensor,
-     block_size: int,
-     row_repeat: int = 1,
-+    mask_outside_bounds: bool = True,
- ) -> None:
-     """Mask packed logits outside causal bounds and request-local candidates."""
-     assert logits.is_cuda
-@@ -218,7 +255,12 @@
-         row_ks is not None,
-         row_repeat,
-     )
--    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
-+    tiles = triton.cdiv(width, 1024)
-+    kernel = _mask_candidates_kernel
-+    if not mask_outside_bounds:
-+        kernel = _mask_visible_candidates_kernel
-+        tiles = min(tiles, max(16, triton.cdiv(1024, rows)))
-+    kernel[(rows, tiles)](
-         logits,
-         row_ks,
-         row_ke,
---- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-+++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-@@ -465,6 +465,10 @@
-         assert not quant_config.per_out_ch_quant
- 
-         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
-+        self._sm120_small_moe = (
-+            current_platform.is_device_capability_family(120)
-+            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
-+        )
- 
-     @staticmethod
-     def activation_format() -> mk.FusedMoEActivationFormat:
-@@ -613,6 +617,28 @@
-         assert self.w1_scale is not None
-         assert self.w2_scale is not None
- 
-+        if (
-+            self._sm120_small_moe
-+            and 0 < hidden_states.size(0) <= 4
-+            and hidden_states.dtype == torch.float8_e4m3fn
-+            and w1.shape == (48, 4608, 2560)
-+            and w2.shape == (48, 5120, 1152)
-+            and self.w1_scale.dtype == torch.int32
-+            and self.w2_scale.dtype == torch.int32
-+            and topk_ids.size(1) == 6
-+            and activation == MoEActivation.SILU
-+            and not apply_router_weight_on_input
-+        ):
-+            from vllm.model_executor.layers.fused_moe.experts.sm120_small_moe import (
-+                small_moe,
-+            )
-+
-+            small_moe(
-+                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
-+                expert_map, a1q_scale, workspace2,
-+            )
-+            return
-+
-         a1q = hidden_states
-         _, N, _ = w1.size()
-         # K comes from activations (full hidden dim), not from w1 which is
---- /dev/null
-+++ b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
-@@ -0,0 +1,126 @@
-+import torch
-+import triton
-+import triton.language as tl
-+
-+
-+@triton.jit
-+def _fp8_pair(packed):
-+    return tl.inline_asm_elementwise(
-+        "cvt.rn.f16x2.e4m3x2 $0, $1;", constraints="=r,h",
-+        args=[packed], dtype=tl.int32, is_pure=True, pack=1)
-+
-+
-+@triton.jit
-+def _dot_pair(x, packed):
-+    return tl.inline_asm_elementwise(
-+        "{ .reg .b32 w, p; .reg .b16 lo, hi; .reg .b8 f4, z; .reg .f32 a, b; "
-+        "mov.b16 {f4, z}, $2; cvt.rn.f16x2.e2m1x2 w, f4; "
-+        "mul.rn.f16x2 p, w, $1; mov.b32 {lo, hi}, p; "
-+        "cvt.f32.f16 a, lo; cvt.f32.f16 b, hi; add.f32 $0, a, b; }",
-+        constraints="=f,r,h", args=[x, packed.to(tl.uint16)],
-+        dtype=tl.float32, is_pure=True, pack=1)
-+
-+
-+@triton.jit
-+def _scale(S, row, k, S0: tl.constexpr, S1: tl.constexpr, PACKED: tl.constexpr, LENGTH: tl.constexpr):
-+    if PACKED:
-+        word = tl.load(S + row * S0 + (k // 512) * S1, k < LENGTH, 0)
-+        exponent = (word >> (((k // 128) % 4) * 8)) & 255
-+        return (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-+    else:
-+        return tl.load(S + row * S0 + (k // 128) * S1, k < LENGTH, 0).to(tl.float32)
-+
-+
-+@triton.jit
-+def _fc1(X, XS, W, WS, IDS, MAP, Y,
-+         K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
-+         X0: tl.constexpr, XS0: tl.constexpr, XS1: tl.constexpr,
-+         W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
-+         S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
-+         IDS0: tl.constexpr, IDS1: tl.constexpr,
-+         HAS_MAP: tl.constexpr, PACKED_XS: tl.constexpr,
-+         BN: tl.constexpr, BK: tl.constexpr):
-+    route = tl.program_id(0)
-+    token = route // TOPK
-+    slot = route % TOPK
-+    expert = tl.load(IDS + token * IDS0 + slot * IDS1)
-+    if HAS_MAP:
-+        expert = tl.load(MAP + expert, expert >= 0, -1)
-+    n = tl.program_id(1) * BN + tl.arange(0, BN)
-+    gate = tl.full((BN, BK), 0, tl.float32)
-+    up = tl.full((BN, BK), 0, tl.float32)
-+    if expert >= 0:
-+        for block in range(triton.cdiv(K, 2 * BK)):
-+            p = block * BK + tl.arange(0, BK)
-+            k = 2 * p
-+            x = _fp8_pair(tl.load(X + token * X0 + p, k < K, 0))
-+            xs = _scale(XS, token, k, XS0, XS1, PACKED_XS, K)
-+            a = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
-+            b = tl.load(W + expert * W0 + (n[:, None] + I) * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
-+            sa = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
-+            sb = tl.load(WS + expert * S0 + (n[:, None] + I) * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
-+            sa = (sa >> (((k[None, :] // 32) & 3) * 8)) & 255
-+            sb = (sb >> (((k[None, :] // 32) & 3) * 8)) & 255
-+            sa = (sa.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-+            sb = (sb.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-+            gate += _dot_pair(x[None, :], a) * (xs[None, :] * sa)
-+            up += _dot_pair(x[None, :], b) * (xs[None, :] * sb)
-+    g = tl.sum(gate, 1)
-+    u = tl.sum(up, 1)
-+    tl.store(Y + route * (2 * I) + n, g, n < I)
-+    tl.store(Y + route * (2 * I) + I + n, u, n < I)
-+
-+
-+@triton.jit
-+def _fc2_reduce(X, XS, W, WS, IDS, MAP, RW, Y,
-+                K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
-+                XS0: tl.constexpr, XS1: tl.constexpr,
-+                W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
-+                S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
-+                IDS0: tl.constexpr, IDS1: tl.constexpr,
-+                RW0: tl.constexpr, RW1: tl.constexpr,
-+                HAS_MAP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-+    token = tl.program_id(0)
-+    n = tl.program_id(1) * BN + tl.arange(0, BN)
-+    result = tl.full((BN,), 0, tl.float32)
-+    for slot in range(TOPK):
-+        expert = tl.load(IDS + token * IDS0 + slot * IDS1)
-+        if HAS_MAP:
-+            expert = tl.load(MAP + expert, expert >= 0, -1)
-+        if expert >= 0:
-+            total = tl.full((BN, BK), 0, tl.float32)
-+            route = token * TOPK + slot
-+            for block in range(triton.cdiv(I, 2 * BK)):
-+                p = block * BK + tl.arange(0, BK)
-+                k = 2 * p
-+                x = _fp8_pair(tl.load(X + route * (I // 2) + p, k < I, 0))
-+                xs = _scale(XS, route, k, XS0, XS1, True, I)
-+                w = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < K) & (k[None, :] < I), 0).to(tl.int32)
-+                s = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < K) & (k[None, :] < I), 0)
-+                s = (s >> (((k[None, :] // 32) & 3) * 8)) & 255
-+                s = (s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-+                total += _dot_pair(x[None, :], w) * (xs[None, :] * s)
-+            value = tl.sum(total, 1).to(tl.bfloat16).to(tl.float32)
-+            weight = tl.load(RW + token * RW0 + slot * RW1)
-+            result += value * weight
-+    tl.store(Y + token * K + n, result, n < K)
-+
-+
-+def small_moe(experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace, bn=4, bk=256):
-+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-+    m, k = x.shape
-+    intermediate = w1.shape[1] // 2
-+    topk = ids.shape[1]
-+    projections = workspace.reshape(-1)[:m * topk * 2 * intermediate].view(m * topk, 2 * intermediate)
-+    _fc1[(m * topk, triton.cdiv(intermediate, bn))](
-+        x.view(torch.uint16), x_scale, w1, experts.w1_scale, ids, expert_map, projections,
-+        k, intermediate, topk, x.stride(0) // 2, *x_scale.stride(),
-+        *w1.stride(), *experts.w1_scale.stride(), *ids.stride(),
-+        expert_map is not None, x_scale.dtype == torch.int32, bn, bk, num_warps=4, enable_fp_fusion=False)
-+    quantized = torch.empty((m * topk, intermediate), device=x.device, dtype=x.dtype)
-+    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
-+    _fc2_reduce[(m, triton.cdiv(k, bn))](
-+        q.view(torch.uint16), scale, w2, experts.w2_scale, ids, expert_map, weights, output,
-+        k, intermediate, topk, *scale.stride(), *w2.stride(), *experts.w2_scale.stride(),
-+        *ids.stride(), *weights.stride(), expert_map is not None, bn, bk,
-+        num_warps=4, enable_fp_fusion=False)

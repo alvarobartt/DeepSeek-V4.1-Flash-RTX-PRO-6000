@@ -4,11 +4,12 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 10. Packed FP4 experts
+## 11. Host all-reduce
 
-- Use native FP4 pair conversion for small expert batches in diff.patch to reduce decoding work and avoid DeepGEMM's 128-row padding.
-- Fuse the down projection with routing-weight reduction to remove separate permutation and reduction passes.
-- Keep DeepGEMM for batches above four rows to preserve its larger-matrix efficiency.
+- Use mapped host memory in diff.patch for small TP reductions because this node only supports direct GPU peer access within pairs.
+- Publish epoch-tagged values in one CUDA kernel and reduce them across SMs in a second kernel to overlap host-memory reads.
+- Accumulate in FP32 in a fixed rank order so all GPUs receive identical BF16 results.
+- Keep reductions above four rows on NCCL because additional host-memory traffic removes the speedup.
 
 Requirements, on a fresh vLLM image:
 
@@ -19,6 +20,7 @@ python3 -m pip install --no-deps --upgrade flashinfer-jit-cache==0.7.1 flashinfe
 vllm_package_dir=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
 patch --batch --forward -p1 -d "$vllm_package_dir/.." < 8-nvidia-rtx-pro-6000/diff.patch
 mkdir -p /tmp/nccl-tuner/tuner \
+nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 ```
@@ -41,14 +43,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 167.8 | 129.9 | 7.24 |
-| 4 | 128 | 387.8 | 117.2 | 12.83 |
-| 8 | 128 | 590.5 | 224.0 | 15.99 |
-| 16 | 128 | 830.9 | 282.0 | 22.11 |
-| 32 | 128 | 1135.2 | 392.2 | 30.81 |
-| 64 | 128 | 1465.6 | 794.0 | 51.60 |
-| 128 | 256 | 2050.5 | 1343.0 | 72.65 |
-| 256 | 512 | 2755.9 | 3725.6 | 206.44 |
+| 1 | 128 | 182.1 | 128.0 | 6.68 |
+| 4 | 128 | 390.1 | 113.6 | 12.04 |
+| 8 | 128 | 586.8 | 211.6 | 15.97 |
+| 16 | 128 | 831.9 | 279.2 | 22.38 |
+| 32 | 128 | 1149.4 | 387.2 | 30.58 |
+| 64 | 128 | 1499.0 | 791.4 | 42.86 |
+| 128 | 256 | 2141.8 | 1322.9 | 75.10 |
+| 256 | 512 | 2741.4 | 3677.1 | 219.44 |
 
 ## Accepted progress
 
@@ -63,4 +65,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 7 | Small-message all-reduce | 151.5 | [`36eef82`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/36eef8206664ec7fe510d0b24f52296a87a950b9) |
 | 8 | Native FP8 cache | 151.8 | [`a9e6ae8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a9e6ae8dd71ddca1d6a113493d382719633b3a5c) |
 | 9 | Bounded candidate masking | 152.0 | [`51061a6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/51061a663497d98b907a35da5ddb76048eaacddb) |
-| 10 | Packed FP4 experts | 167.8 | This revision |
+| 10 | Packed FP4 experts | 167.8 | [`9253782`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/92537829d7ce003664a820e67d61e12b39680329) |
+| 11 | Host all-reduce | 182.1 | This revision |
