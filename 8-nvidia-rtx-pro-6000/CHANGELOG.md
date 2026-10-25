@@ -4,9 +4,10 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 6. Indexer scratch memory
+## 7. Small-message all-reduce
 
-- Extend the 512 MiB logits budget to sm120 decode without a candidate cache in diff.patch, reducing CUDA graph memory from 19.74 to 9.05 GiB per GPU.
+- Add an NCCL tuner in diff.patch to select Tree for all-reduce messages up to 64 KiB on eight GPUs, reducing small-batch communication latency while leaving larger messages on NCCL's default policy.
+- Name the tuner library `libvllm-sm120-tuner.so` because DeepEP treats loaded `libnccl*` files as NCCL runtimes.
 
 Requirements, on a fresh vLLM image:
 
@@ -16,6 +17,9 @@ python3 -m pip install --no-deps --upgrade flashinfer-cubin==0.7.1 --index-url h
 python3 -m pip install --no-deps --upgrade flashinfer-jit-cache==0.7.1 flashinfer-jit-cache-sm120f==0.7.1 --index-url https://flashinfer.ai/whl/cu130
 vllm_package_dir=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
 patch --batch --forward -p1 -d "$vllm_package_dir/.." < 8-nvidia-rtx-pro-6000/diff.patch
+mkdir -p /tmp/nccl-tuner/tuner \
+export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
+export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 ```
 
 Then, run server as:
@@ -36,14 +40,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 138.4 | 132.0 | 8.83 |
-| 4 | 128 | 372.5 | 119.3 | 13.11 |
-| 8 | 128 | 558.5 | 212.5 | 16.96 |
-| 16 | 128 | 813.3 | 280.1 | 23.15 |
-| 32 | 128 | 1110.6 | 492.4 | 30.43 |
-| 64 | 128 | 1448.0 | 803.4 | 46.28 |
-| 128 | 256 | 2022.5 | 1378.0 | 74.79 |
-| 256 | 512 | 2721.4 | 2832.3 | 152.44 |
+| 1 | 128 | 151.5 | 132.9 | 8.20 |
+| 4 | 128 | 377.8 | 112.4 | 12.98 |
+| 8 | 128 | 561.9 | 210.8 | 16.65 |
+| 16 | 128 | 809.9 | 277.5 | 22.70 |
+| 32 | 128 | 1117.3 | 393.7 | 31.65 |
+| 64 | 128 | 1432.5 | 808.0 | 49.45 |
+| 128 | 256 | 2074.2 | 1323.4 | 74.08 |
+| 256 | 512 | 2778.4 | 2906.4 | 143.81 |
 
 ## Accepted progress
 
@@ -54,4 +58,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 3 | Three-token drafts | 155.8 | [`992d4ea`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/992d4eac7bd5f3aab0f2e62a012719471ffffb18) |
 | 4 | Adaptive verification | 150.8 | [`aa424d6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/aa424d635c4004b144357dbd9518c91f112f8602) |
 | 5 | Expert parallelism | 138.0 | [`c5aada3`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c5aada30e6d6be4d72714d1bad1446d6e35abd00) |
-| 6 | Indexer scratch memory | 138.4 | This revision |
+| 6 | Indexer scratch memory | 138.4 | [`891d19f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/891d19f0991391ec7d65bf11ca467aef21ffa5c4) |
+| 7 | Small-message all-reduce | 151.5 | This revision |

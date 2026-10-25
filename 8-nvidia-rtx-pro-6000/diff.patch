@@ -435,3 +435,49 @@
  
          if needs_padded_path:
              # if padded, we need to unpack
+--- /dev/null
++++ b/vllm/distributed/nccl_tuner.cc
+@@ -0,0 +1,43 @@
++#include <cmath>
++#include <cstdlib>
++#include "nccl_tuner.h"
++
++struct Context {
++    bool enabled;
++};
++
++static ncclResult_t init(size_t ranks, size_t nodes, ncclDebugLogger_t log, void** context) {
++    auto* state = static_cast<Context*>(std::malloc(sizeof(Context)));
++    if (state == nullptr) return ncclSystemError;
++    state->enabled = ranks == 8 && nodes == 1;
++    *context = state;
++    if (state->enabled && log != nullptr) {
++        log(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__, "TUNER/sm120: small all-reduce Tree policy enabled");
++    }
++    return ncclSuccess;
++}
++
++static ncclResult_t tune(void* context, ncclFunc_t function, size_t bytes, int,
++                        float** costs, int algorithms, int protocols, int, int*) {
++    auto* state = static_cast<Context*>(context);
++    if (state == nullptr || !state->enabled || function != ncclFuncAllReduce ||
++        bytes > 65536 || algorithms <= NCCL_ALGO_TREE || protocols < 1) return ncclSuccess;
++    auto* table = reinterpret_cast<float*>(costs);
++    int best = -1;
++    for (int protocol = 0; protocol < protocols; ++protocol) {
++        int index = NCCL_ALGO_TREE * protocols + protocol;
++        if (table[index] >= 0.0f && std::isfinite(table[index]) &&
++            (best < 0 || table[index] < table[best])) best = index;
++    }
++    if (best >= 0) table[best] = 0.0f;
++    return ncclSuccess;
++}
++
++static ncclResult_t destroy(void* context) {
++    std::free(context);
++    return ncclSuccess;
++}
++
++extern "C" {
++    ncclTuner_v4_t ncclTunerPlugin_v4 = {"sm120-small-allreduce", init, tune, destroy};
++}
