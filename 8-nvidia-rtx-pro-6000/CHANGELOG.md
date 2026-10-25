@@ -4,10 +4,9 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 8. Native FP8 cache
+## 9. Bounded candidate masking
 
-- Connect vLLM's existing V4.1 cache writers to FlashInfer 0.7.1's sm120 kernels because the original sm120 path still uses the older V4 layout.
-- Quantize the RoPE dimensions to FP8 alongside the other cache values, reducing each record from 584 to 528 bytes and CUDA graph memory from 9.05 to 8.32 GiB per GPU.
+- Mask only valid logits during sm120 decode in diff.patch because top-k already ignores columns beyond each request's context.
 
 Requirements, on a fresh vLLM image:
 
@@ -40,14 +39,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 151.8 | 129.6 | 7.94 |
-| 4 | 128 | 380.7 | 110.3 | 12.94 |
-| 8 | 128 | 578.9 | 218.0 | 15.89 |
-| 16 | 128 | 817.6 | 280.7 | 22.73 |
-| 32 | 128 | 1123.7 | 393.4 | 30.40 |
-| 64 | 128 | 1461.5 | 809.5 | 50.33 |
-| 128 | 256 | 2073.4 | 1561.4 | 73.73 |
-| 256 | 512 | 2762.7 | 2678.8 | 135.82 |
+| 1 | 128 | 152.0 | 129.8 | 7.88 |
+| 4 | 128 | 378.7 | 113.4 | 12.74 |
+| 8 | 128 | 582.4 | 214.0 | 15.74 |
+| 16 | 128 | 831.4 | 275.5 | 22.44 |
+| 32 | 128 | 1139.8 | 388.6 | 30.54 |
+| 64 | 128 | 1470.3 | 801.5 | 43.60 |
+| 128 | 256 | 2097.0 | 1354.1 | 72.29 |
+| 256 | 512 | 2820.1 | 2783.5 | 139.30 |
 
 ## Accepted progress
 
@@ -60,4 +59,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 5 | Expert parallelism | 138.0 | [`c5aada3`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c5aada30e6d6be4d72714d1bad1446d6e35abd00) |
 | 6 | Indexer scratch memory | 138.4 | [`891d19f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/891d19f0991391ec7d65bf11ca467aef21ffa5c4) |
 | 7 | Small-message all-reduce | 151.5 | [`36eef82`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/36eef8206664ec7fe510d0b24f52296a87a950b9) |
-| 8 | Native FP8 cache | 151.8 | This revision |
+| 8 | Native FP8 cache | 151.8 | [`a9e6ae8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a9e6ae8dd71ddca1d6a113493d382719633b3a5c) |
+| 9 | Bounded candidate masking | 152.0 | This revision |

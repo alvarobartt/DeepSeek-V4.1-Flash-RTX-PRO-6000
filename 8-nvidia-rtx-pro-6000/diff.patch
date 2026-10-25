@@ -54,7 +54,7 @@
      has_deep_gemm,
  )
  from vllm.utils.import_utils import has_cutedsl
-@@ -806,84 +807,127 @@
+@@ -806,84 +807,130 @@
              if use_fp4_cache
              else padded_q_quant_decode_tokens
          )
@@ -196,6 +196,9 @@
 +                        decode_candidates,
 +                        candidate_block_size,
 +                        row_repeat,
++                        mask_outside_bounds=not (
++                            current_platform.is_device_capability_family(120)
++                        ),
 +                    )
 +            chunk_topk = topk_indices_buffer[row_start:row_end, :topk_tokens]
 +            get_indexer_topk(topk_backend)(
@@ -521,3 +524,70 @@
          and has_deep_gemm()
      )
  
+--- a/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
++++ b/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
+@@ -136,6 +136,42 @@
+         -float("inf"),
+         (cols < width) & ~(valid & keep),
+     )
++
++
++@triton.jit(do_not_specialize=["width", "nblocks"])
++def _mask_visible_candidates_kernel(
++    logits,
++    starts,
++    ends,
++    flags,
++    stride_row,
++    stride_col,
++    stride_start,
++    stride_end,
++    width,
++    nblocks,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    ROW_REPEAT: tl.constexpr,
++    TILE: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
++    end = tl.minimum(tl.load(ends + row // ROW_REPEAT * stride_end), width)
++    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
++    first = tl.maximum(start, 0) + tl.program_id(1) * TILE
++    step = tl.num_programs(1) * TILE
++    for offset in range(first, end, step):
++        cols = offset + tl.arange(0, TILE)
++        valid = cols < end
++        block = (cols - start) // BLOCK_SIZE
++        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
++        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
++        tl.store(
++            logits + row * stride_row + cols * stride_col,
++            -float("inf"),
++            valid & ~keep,
++        )
+ 
+ 
+ def select_candidate_blocks(
+@@ -196,6 +232,7 @@
+     candidate_blocks: torch.Tensor,
+     block_size: int,
+     row_repeat: int = 1,
++    mask_outside_bounds: bool = True,
+ ) -> None:
+     """Mask packed logits outside causal bounds and request-local candidates."""
+     assert logits.is_cuda
+@@ -218,7 +255,12 @@
+         row_ks is not None,
+         row_repeat,
+     )
+-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
++    tiles = triton.cdiv(width, 1024)
++    kernel = _mask_candidates_kernel
++    if not mask_outside_bounds:
++        kernel = _mask_visible_candidates_kernel
++        tiles = min(tiles, max(16, triton.cdiv(1024, rows)))
++    kernel[(rows, tiles)](
+         logits,
+         row_ks,
+         row_ke,
