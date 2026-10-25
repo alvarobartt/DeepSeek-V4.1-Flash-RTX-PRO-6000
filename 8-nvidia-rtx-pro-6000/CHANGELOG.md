@@ -4,11 +4,10 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 2. DSpark decoding
+## 3. Three-token drafts
 
-- Enable the checkpoint's five-token DSpark draft so the target model can verify several tokens in one pass.
-- Bound indexer logits to the profiled 512 MiB budget because the original allocation failed with CUDA OOM at concurrency 256.
--    --block-size 64
+- Reduce the draft from five to three tokens because later positions are rarely accepted and still add verification work.
+-    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170"}'
 
 Requirements, on a fresh vLLM image:
 
@@ -32,23 +31,24 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --reasoning-parser deepseek_v41 \
     --mm-encoder-tp-mode data \
     --block-size 64 \
-    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170"}'
+    --speculative-config '{"method":"dspark","num_speculative_tokens":3,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170"}'
 ```
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 159.2 | 136.6 | 8.17 |
-| 4 | 128 | 380.4 | 134.1 | 13.32 |
-| 8 | 128 | 496.2 | 223.9 | 20.79 |
-| 16 | 128 | 650.5 | 283.8 | 30.43 |
-| 32 | 128 | 954.1 | 434.3 | 38.53 |
-| 64 | 128 | 1185.0 | 903.5 | 65.98 |
-| 128 | 256 | 1471.9 | 1508.4 | 93.65 |
-| 256 | 512 | 1726.3 | 3355.1 | 170.67 |
+| 1 | 128 | 155.8 | 136.2 | 7.61 |
+| 4 | 128 | 383.7 | 116.2 | 12.26 |
+| 8 | 128 | 528.1 | 225.2 | 17.13 |
+| 16 | 128 | 681.7 | 284.8 | 26.60 |
+| 32 | 128 | 909.9 | 427.0 | 39.72 |
+| 64 | 128 | 1227.4 | 872.2 | 50.68 |
+| 128 | 256 | 1677.5 | 1451.8 | 81.97 |
+| 256 | 512 | 2288.8 | 2785.3 | 143.19 |
 
 ## Accepted progress
 
 | Stage | Change | c1 t/s | Revision |
 |---:|---|---:|---|
 | 1 | sm120 support | 85.0 | [`0cd46b2`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/0cd46b25086a61436eb0979abf115f66442e889e) |
-| 2 | DSpark decoding | 159.2 | This revision |
+| 2 | DSpark decoding | 159.2 | [`e5ac344`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/e5ac344074d1e9141c50e3178cde4e2a3680da8b) |
+| 3 | Three-token drafts | 155.8 | This revision |
