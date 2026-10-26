@@ -4,10 +4,9 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 18. Cold-start guards
+## 19. Counter-safe collectives
 
-- Extend the host collective's bounded peer wait so cold kernel compilation on one rank does not abort the others.
-- Require the checkpoint's 384-entry expert map before using the target MoE fast path to avoid unsupported routing layouts under TP + DP.
+- Clear reused slots at counter boundaries and track peer readiness separately to prevent stale packets from being read.
 
 Requirements, on a fresh vLLM image:
 
@@ -41,14 +40,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 209.3 | 127.2 | 5.90 |
-| 4 | 128 | 528.4 | 101.7 | 9.47 |
-| 8 | 128 | 732.9 | 220.3 | 12.55 |
-| 16 | 128 | 994.4 | 271.3 | 18.35 |
-| 32 | 128 | 1328.6 | 381.3 | 26.47 |
-| 64 | 128 | 1672.3 | 819.1 | 48.96 |
-| 128 | 256 | 2241.0 | 1455.8 | 74.79 |
-| 256 | 512 | 2953.3 | 2718.6 | 137.01 |
+| 1 | 128 | 211.4 | 127.9 | 5.90 |
+| 4 | 128 | 523.3 | 103.1 | 9.26 |
+| 8 | 128 | 736.2 | 204.3 | 13.12 |
+| 16 | 128 | 1000.1 | 280.8 | 18.36 |
+| 32 | 128 | 1319.1 | 653.6 | 29.17 |
+| 64 | 128 | 1647.7 | 794.4 | 41.00 |
+| 128 | 256 | 2239.7 | 1503.9 | 68.28 |
+| 256 | 512 | 2983.6 | 2660.2 | 135.16 |
 
 ## Accepted progress
 
@@ -71,4 +70,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 15 | Wider grouped experts | 209.9 | [`a2b480a`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a2b480a3526a3a235f7113b630650516733f658f) |
 | 16 | Sharded draft sampling | 211.3 | [`e36008c`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/e36008c9f6a7cd5c1cb9f55e8082ede7341164e5) |
 | 17 | Medium grouped experts | 211.7 | [`ba418b9`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/ba418b932c779f5224cc2657e52a769112cf0917) |
-| 18 | Cold-start guards | 209.3 | This revision |
+| 18 | Cold-start guards | 209.3 | [`62b3bf7`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/62b3bf717ce8447cd20c62b06a2bfbe781b6836d) |
+| 19 | Counter-safe collectives | 211.4 | This revision |
