@@ -88,7 +88,7 @@
 +        if (peer == rank) value = input[i];
 +        else {
 +            const uint64_t* address = slot + size_t(peer) * stride + i;
-+            const uint64_t deadline = clock64() + 5000000000ull;
++            const uint64_t deadline = clock64() + 180000000000ull;
 +            uint64_t packet;
 +            do {
 +                asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(packet) : "l"(address) : "memory");
@@ -139,7 +139,7 @@
 +    const uint32_t epoch = *counter;
 +    const uint32_t tag = epoch ^ 0x80000000u;
 +    const uint64_t* address = shared + size_t(epoch & 1u) * 8 * stride + size_t(owner) * stride + i;
-+    const uint64_t deadline = clock64() + 5000000000ull;
++    const uint64_t deadline = clock64() + 180000000000ull;
 +    uint64_t packet;
 +    do {
 +        asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(packet) : "l"(address) : "memory");
@@ -425,12 +425,14 @@
  
      @staticmethod
      def activation_format() -> mk.FusedMoEActivationFormat:
-@@ -613,6 +617,28 @@
+@@ -613,6 +617,30 @@
          assert self.w1_scale is not None
          assert self.w2_scale is not None
  
 +        if (
 +            self._sm120_small_moe
++            and expert_map is not None
++            and expert_map.numel() == 384
 +            and 0 < hidden_states.size(0) <= 96
 +            and hidden_states.dtype == torch.float8_e4m3fn
 +            and w1.shape == (48, 4608, 2560)
