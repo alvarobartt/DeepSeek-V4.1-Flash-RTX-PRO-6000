@@ -1091,6 +1091,62 @@
  
      def __init__(self, *args, **kwargs):
          super().__init__(*args, **kwargs)
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -24,6 +24,7 @@
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+     mhc_post_tilelang,
+@@ -344,9 +345,42 @@
+         """Base logits U_k = lm_head(norm(head_hidden))."""
+         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+ 
+-    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        # Full-vocab draft: base logits, no d2t scatter.
+-        return self.compute_logits(hidden_states)
++    def compute_draft_logits(
++        self, hidden_states: torch.Tensor, skip_gather: bool = False
++    ) -> torch.Tensor:
++        return self.logits_processor(
++            self.lm_head, self.model.norm(hidden_states), skip_gather=skip_gather
++        )
++
++    def get_draft_top_tokens(
++        self, base_logits: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor:
++        start = self.lm_head.shard_indices.org_vocab_start_index
++        count = base_logits.shape[-1] - self.lm_head.shard_indices.num_org_vocab_padding
++        processor = self.logits_processor
++        weight = self.model.markov_head.markov_w2.weight[start : start + count]
++        if processor.head_dtype is None or processor.head_dtype == markov_embed.dtype:
++            bias = torch.nn.functional.linear(markov_embed, weight)
++        elif processor.head_dtype == torch.float32:
++            bias = torch.mm(markov_embed, weight.t(), out_dtype=torch.float32)
++        else:
++            bias = self.markov_bias(markov_embed)[:, start : start + count]
++        if processor.head_dtype in (None, markov_embed.dtype, torch.float32):
++            if processor.soft_cap is not None:
++                bias = torch.tanh(bias / processor.soft_cap) * processor.soft_cap
++            if processor.scale != 1.0:
++                bias = bias * processor.scale
++        scores = base_logits[:, :count] + bias
++        values, indices = scores.max(dim=-1)
++        indices = indices + start
++        if self.lm_head.tp_size == 1:
++            return indices
++        dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
++        pairs = torch.stack([values.to(dtype), indices.to(dtype)], dim=-1)
++        gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
++        gathered = gathered.view(base_logits.shape[0], self.lm_head.tp_size, 2)
++        winners = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
++        return gathered[:, :, 1].gather(-1, winners).squeeze(-1).to(torch.int64)
+ 
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+         return draft_ids  # full-vocab: draft ids are target ids
 --- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
 +++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
 @@ -25,17 +25,20 @@
@@ -1300,4 +1356,61 @@
 +        )
          and has_deep_gemm()
      )
+ 
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -113,6 +113,20 @@
+             self.use_acceptance_estimator = False
+         return model
+ 
++    def _validate_local_argmax_reduction(self) -> None:
++        if not self.use_local_argmax_reduction:
++            return
++        if (
++            self.draft_logits is not None
++            or self._draft_topk is not None
++            or not hasattr(self.model, "get_draft_top_tokens")
++        ):
++            raise ValueError(
++                "Local DSpark argmax requires a supported full-vocabulary "
++                "draft model, greedy drafting, and no draft top-k truncation."
++            )
++        logger.info("Using vocabulary-parallel argmax for DSpark Markov sampling.")
++
+     def _sample_logits(
+         self,
+         logits: torch.Tensor,
+@@ -164,7 +178,10 @@
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        if self.use_local_argmax_reduction:
++            base_logits = self.model.compute_draft_logits(sample_hidden, skip_gather=True)
++        else:
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -181,11 +198,16 @@
+             markov_embed = self.model.markov_embed(prev)
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+-            bias = self.model.markov_bias(markov_embed)
+-            logits_i = base_logits[:, i] + bias
+-            draft_sampled_i = self._sample_logits(
+-                logits_i, idx_map[:, i], sample_pos[:, i], i
+-            )
++            if self.use_local_argmax_reduction:
++                draft_sampled_i = self.model.get_draft_top_tokens(
++                    base_logits[:, i], markov_embed
++                )
++            else:
++                bias = self.model.markov_bias(markov_embed)
++                logits_i = base_logits[:, i] + bias
++                draft_sampled_i = self._sample_logits(
++                    logits_i, idx_map[:, i], sample_pos[:, i], i
++                )
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
  
