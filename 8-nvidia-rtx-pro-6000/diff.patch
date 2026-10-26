@@ -431,7 +431,7 @@
  
 +        if (
 +            self._sm120_small_moe
-+            and 0 < hidden_states.size(0) <= 4
++            and 0 < hidden_states.size(0) <= 16
 +            and hidden_states.dtype == torch.float8_e4m3fn
 +            and w1.shape == (48, 4608, 2560)
 +            and w2.shape == (48, 5120, 1152)

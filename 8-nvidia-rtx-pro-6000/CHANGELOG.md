@@ -4,11 +4,9 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 14. Grouped expert GEMMs
+## 15. Wider grouped experts
 
-- Use the grouped sm120 GEMMs already provided by FlashInfer 0.7.1 in diff.patch for two-to-four-row expert batches because they avoid scalar dot-product loops.
-- Cache transposed scales so each decode step can reuse FlashInfer’s scale layout.
-- Keep the existing one-row kernel because grouped dispatch adds overhead for that batch size.
+- Extend the grouped expert path in diff.patch from four to sixteen rows because it is faster than DeepGEMM for those batches.
 
 Requirements, on a fresh vLLM image:
 
@@ -42,14 +40,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 209.0 | 129.4 | 5.88 |
-| 4 | 128 | 422.1 | 113.0 | 11.60 |
-| 8 | 128 | 598.6 | 213.6 | 16.86 |
-| 16 | 128 | 849.2 | 276.5 | 22.39 |
-| 32 | 128 | 1152.1 | 519.7 | 31.86 |
-| 64 | 128 | 1476.6 | 827.4 | 44.20 |
-| 128 | 256 | 2099.3 | 1414.5 | 72.53 |
-| 256 | 512 | 2827.0 | 2794.2 | 140.71 |
+| 1 | 128 | 209.9 | 127.3 | 5.89 |
+| 4 | 128 | 521.0 | 110.6 | 9.27 |
+| 8 | 128 | 722.4 | 209.9 | 12.94 |
+| 16 | 128 | 859.5 | 279.6 | 22.26 |
+| 32 | 128 | 1180.9 | 388.0 | 31.87 |
+| 64 | 128 | 1548.2 | 795.2 | 48.56 |
+| 128 | 256 | 2119.1 | 1424.1 | 73.18 |
+| 256 | 512 | 2860.3 | 2741.0 | 141.28 |
 
 ## Accepted progress
 
@@ -68,4 +66,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 11 | Host all-reduce | 182.1 | [`f00f364`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/f00f36484aed613e5b1a86566f60fdf9b9e78284) |
 | 12 | Host reduce-scatter | 194.2 | [`d6c2e43`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/d6c2e436e35434ee70c24ac354db8cbd22f86df8) |
 | 13 | Wider host reductions | 194.5 | [`2a5cf80`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/2a5cf807aa60bccd4f3ced6a49b39ee1c5f25970) |
-| 14 | Grouped expert GEMMs | 209.0 | This revision |
+| 14 | Grouped expert GEMMs | 209.0 | [`3f93e68`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/3f93e6858c94c6eee506cd5331e23bde65f6e38b) |
+| 15 | Wider grouped experts | 209.9 | This revision |
