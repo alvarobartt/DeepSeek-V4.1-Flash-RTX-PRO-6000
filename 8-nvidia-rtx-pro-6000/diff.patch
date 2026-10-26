@@ -455,8 +455,239 @@
          _, N, _ = w1.size()
          # K comes from activations (full hidden dim), not from w1 which is
 --- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_grouped_moe.py
+@@ -0,0 +1,228 @@
++import torch
++import triton
++import triton.language as tl
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
++    make_mxfp8_q0_route_workspace,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import (
++    route_assign_decode_kernel,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import (
++    SF_M_ALIGN,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import (
++    cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
++)
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++
++@triton.jit
++def _map_ids(IDS, MAP, LOCAL, N: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.arange(0, BLOCK)
++    expert = tl.load(IDS + r, r < N, -1)
++    local = tl.load(MAP + expert, (r < N) & (expert >= 0), -1)
++    tl.store(LOCAL + r, local, r < N)
++
++
++@triton.jit
++def _copy_quantized(
++    X,
++    XS,
++    DST,
++    SFDST,
++    Q,
++    SF,
++    K: tl.constexpr,
++    TOPK: tl.constexpr,
++    XS0: tl.constexpr,
++    XS1: tl.constexpr,
++    SF0: tl.constexpr,
++    SF1: tl.constexpr,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    block = tl.program_id(1)
++    token = route // TOPK
++    dest = tl.load(DST + route)
++    sfrow = tl.load(SFDST + route)
++    cols = block * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + token * K + cols, cols < K, 0)
++    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
++    for part in tl.static_range(BLOCK // 512):
++        word = block * (BLOCK // 512) + part
++        if PACKED_XS:
++            scale = tl.load(
++                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
++            )
++        else:
++            scale = tl.full((), 0, tl.int32)
++            for group in tl.static_range(4):
++                sf = tl.load(
++                    XS + token * XS0 + (word * 4 + group) * XS1,
++                    word * 4 + group < triton.cdiv(K, 128),
++                    0,
++                )
++                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++                scale = scale | exponent << group * 8
++        tl.store(
++            SF + word * SF0 + sfrow * SF1,
++            scale,
++            (word < triton.cdiv(K, 512)) & (dest >= 0),
++        )
++
++
++@triton.jit
++def _copy_scales(
++    XS,
++    DST,
++    SFDST,
++    SF,
++    K: tl.constexpr,
++    XS0: tl.constexpr,
++    XS1: tl.constexpr,
++    SF0: tl.constexpr,
++    SF1: tl.constexpr,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    source = tl.load(DST + route)
++    dest = tl.load(SFDST + route)
++    word = tl.arange(0, BLOCK)
++    valid = (source >= 0) & (word < triton.cdiv(K, 512))
++    if PACKED_XS:
++        scale = tl.load(XS + source * XS0 + word * XS1, valid, 0)
++    else:
++        scale = tl.full((BLOCK,), 0, tl.int32)
++        for group in tl.static_range(4):
++            sf = tl.load(
++                XS + source * XS0 + (word * 4 + group) * XS1,
++                (source >= 0) & (word * 4 + group < triton.cdiv(K, 128)),
++                0,
++            )
++            exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++            scale = scale | exponent << group * 8
++    tl.store(SF + word * SF0 + dest * SF1, scale, valid)
++
++
++@triton.jit
++def _reduce(Y, DST, RW, OUT, K: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    value = tl.full((BLOCK,), 0, tl.float32)
++    for slot in range(TOPK):
++        row = tl.load(DST + token * TOPK + slot)
++        weight = tl.load(RW + token * TOPK + slot)
++        x = tl.load(Y + row * K + cols, (row >= 0) & (cols < K), 0).to(tl.float32)
++        value += x * weight
++    tl.store(OUT + token * K + cols, value, cols < K)
++
++
++def prepare(experts, w1, w2):
++    source = (experts.w1_scale.data_ptr(), experts.w2_scale.data_ptr())
++    if getattr(experts, "_sm120_grouped_source", None) != source:
++        experts._sm120_grouped_scales = (
++            experts.w1_scale.permute(0, 2, 1).contiguous(),
++            experts.w2_scale.permute(0, 2, 1).contiguous(),
++        )
++        experts._sm120_grouped_source = source
++
++
++def small_moe(
++    experts,
++    output,
++    x,
++    w1,
++    w2,
++    weights,
++    ids,
++    expert_map,
++    x_scale,
++    workspace,
++    bn=4,
++    bk=256,
++):
++    prepare(experts, w1, w2)
++    b, ds = experts._sm120_grouped_scales
++    a, down = (w1, w2)
++    m, k = x.shape
++    topk = ids.shape[1]
++    pairs = ids.numel()
++    mapped = torch.empty_like(ids)
++    _map_ids[1,](
++        ids, expert_map, mapped, pairs, triton.next_power_of_2(pairs), num_warps=4
++    )
++    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
++    total_scale = route.scale_out.numel()
++    grid = max(w1.shape[0], pairs, triton.cdiv(total_scale, 256))
++    route_assign_decode_kernel[grid,](
++        mapped,
++        weights,
++        route.offsets,
++        route.token_map,
++        route.token_weights,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.scale_out,
++        pairs,
++        topk,
++        w1.shape[0],
++        SF_M_ALIGN,
++        256,
++        total_scale,
++        route.scale_out.shape[1],
++        *route.scale_out.stride(),
++        num_warps=4,
++    )
++    _copy_quantized[pairs, triton.cdiv(k, 1024)](
++        x.view(torch.uint8),
++        x_scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.q_out.view(torch.uint8),
++        route.scale_out,
++        k,
++        topk,
++        *x_scale.stride(),
++        *route.scale_out.stride(),
++        x_scale.dtype == torch.int32,
++        1024,
++        num_warps=4,
++    )
++    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
++        route.q_out, route.scale_out, a, b, route.offsets, tune=False
++    )
++    intermediate = w1.shape[1] // 2
++    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    sf2 = torch.zeros(
++        (triton.cdiv(intermediate, 512), route.scale_out.shape[1]),
++        device=x.device,
++        dtype=torch.int32,
++    )
++    _copy_scales[pairs,](
++        scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        sf2,
++        intermediate,
++        *scale.stride(),
++        *sf2.stride(),
++        scale.dtype == torch.int32,
++        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
++        num_warps=4,
++    )
++    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tune=False)
++    _reduce[m, triton.cdiv(k, 256)](
++        y,
++        route.dst_rows,
++        weights,
++        output,
++        k,
++        topk,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return output
+--- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,133 @@
 +import torch
 +import triton
 +import triton.language as tl
@@ -568,6 +799,13 @@
 +def small_moe(experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace, bn=4, bk=256):
 +    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 +    m, k = x.shape
++    if m >= 2:
++        from vllm.model_executor.layers.fused_moe.experts.sm120_grouped_moe import (
++            small_moe as grouped_moe,
++        )
++        return grouped_moe(
++            experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace,
++        )
 +    intermediate = w1.shape[1] // 2
 +    topk = ids.shape[1]
 +    projections = workspace.reshape(-1)[:m * topk * 2 * intermediate].view(m * topk, 2 * intermediate)
