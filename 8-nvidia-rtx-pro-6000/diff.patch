@@ -197,7 +197,7 @@
 +}
 --- /dev/null
 +++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.py
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,101 @@
 +import ctypes
 +import mmap
 +import os
@@ -237,7 +237,8 @@
 +            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
 +        )
 +        self.lib.launch_host_ll.restype = ctypes.c_int
-+        self.stride = 10240
++        self.max_rows = 16
++        self.stride = self.max_rows * 5120 // 2
 +        size = 2 * 8 * self.stride * 8
 +        paths = ['/dev/shm/vllm-sm120-' + uuid.uuid4().hex if self.rank == 0 else None]
 +        dist.broadcast_object_list(paths, src=dist.get_process_group_ranks(group)[0], group=group)
@@ -279,7 +280,7 @@
 +            and tensor.is_contiguous()
 +            and tensor.ndim == 2
 +            and tensor.shape[-1] == 5120
-+            and 1 <= tensor.shape[0] <= 4
++            and 1 <= tensor.shape[0] <= self.max_rows
 +        )
 +
 +    def all_reduce(self, tensor):
