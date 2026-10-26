@@ -425,7 +425,7 @@
  
      @staticmethod
      def activation_format() -> mk.FusedMoEActivationFormat:
-@@ -613,6 +617,28 @@
+@@ -613,6 +617,29 @@
          assert self.w1_scale is not None
          assert self.w2_scale is not None
  
@@ -433,8 +433,9 @@
 +            self._sm120_small_moe
 +            and 0 < hidden_states.size(0) <= 96
 +            and hidden_states.dtype == torch.float8_e4m3fn
-+            and w1.shape == (48, 4608, 2560)
-+            and w2.shape == (48, 5120, 1152)
++            and w1.shape[0] in (48, 96)
++            and w1.shape[1:] == (4608, 2560)
++            and w2.shape == (w1.shape[0], 5120, 1152)
 +            and self.w1_scale.dtype == torch.int32
 +            and self.w2_scale.dtype == torch.int32
 +            and topk_ids.size(1) == 6

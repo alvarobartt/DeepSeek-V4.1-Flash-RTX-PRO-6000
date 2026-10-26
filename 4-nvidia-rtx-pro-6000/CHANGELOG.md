@@ -4,11 +4,9 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 1. DSpark decoding
+## 2. Ninety-six local experts
 
-- Reuse three-token adaptive DSpark with local argmax reduction to verify multiple tokens per target pass without gathering the full vocabulary.
-- Raise GPU memory utilization to 97% because DSpark's larger CUDA graph allocation leaves no KV-cache blocks at the default 92%.
--    --enable-expert-parallel
+- Extend the small-batch expert kernels to 96 local experts because TP4 previously fell back to DeepGEMM's 128-row padding.
 
 Requirements, on a fresh vLLM image:
 
@@ -43,18 +41,19 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 131.3 | 134.1 | 9.31 |
-| 4 | 128 | 305.4 | 139.3 | 14.95 |
-| 8 | 128 | 450.0 | 232.0 | 20.57 |
-| 16 | 128 | 646.7 | 306.9 | 29.31 |
-| 32 | 128 | 929.3 | 433.6 | 36.76 |
-| 64 | 128 | 1216.4 | 788.1 | 50.59 |
-| 128 | 256 | 1779.2 | 1669.4 | 76.92 |
-| 256 | 512 | 2090.1 | 5044.1 | 513.58 |
+| 1 | 128 | 161.5 | 134.2 | 7.58 |
+| 4 | 128 | 398.5 | 127.7 | 12.47 |
+| 8 | 128 | 582.3 | 227.3 | 15.83 |
+| 16 | 128 | 798.6 | 284.7 | 23.55 |
+| 32 | 128 | 1126.5 | 498.2 | 32.29 |
+| 64 | 128 | 1354.5 | 876.9 | 54.17 |
+| 128 | 256 | 1850.7 | 1527.0 | 79.03 |
+| 256 | 512 | 2506.8 | 2850.4 | 141.25 |
 
 ## Accepted progress
 
 | Stage | Change | c1 t/s | Revision |
 |---:|---|---:|---|
 | 0 | Four-GPU baseline | 68.9 | [`98e3fb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/98e3fb632bb37dea066d2f7d9cb6f1b4a436cb4d) |
-| 1 | DSpark decoding | 131.3 | This revision |
+| 1 | DSpark decoding | 131.3 | [`dee02d3`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/dee02d3567a50684bf4abb462d28390b3c3c9460) |
+| 2 | Ninety-six local experts | 161.5 | This revision |
