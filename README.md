@@ -30,6 +30,25 @@ Validated serving recipes for four and eight GPUs, using the checkpoint's origin
 
 See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rtx-pro-6000/CHANGELOG.md).
 
+## 4 x NVIDIA RTX PRO 6000
+
+| Concurrency | Baseline t/s [^4gpu-baseline] | Baseline + DSpark t/s | Current t/s |
+|---:|---:|---:|---:|
+| 1 | **68.9** | Not measured | **68.9** |
+| 4 | **216.8** | Not measured | **216.8** |
+| 8 | **317.3** | Not measured | **317.3** |
+| 16 | **425.8** | Not measured | **425.8** |
+| 32 | **553.8** | Not measured | **553.8** |
+| 64 | **735.3** | Not measured | **735.3** |
+| 128 | **1147.5** | Not measured | **1147.5** |
+| 256 | **1683.6** | Not measured | **1683.6** |
+
+![Accepted ShareGPT c1 throughput](4-nvidia-rtx-pro-6000/throughput.png)
+
+![ShareGPT throughput by concurrency](4-nvidia-rtx-pro-6000/concurrency.png)
+
+See the detailed changelog in [`4-nvidia-rtx-pro-6000/CHANGELOG.md`](4-nvidia-rtx-pro-6000/CHANGELOG.md).
+
 Run the requirements and full `vllm serve` command in the hardware changelog; each directory also includes a Dockerfile that retains the image's default entrypoint without model or parallelism defaults.
 
 Measurements use `vllm bench serve` with ShareGPT, seed 0, temperature 0, dataset output lengths, and matching-concurrency warmups, with 128 measured prompts through c64, 256 at c128, and 512 at c256.
@@ -43,3 +62,4 @@ The measured model revision retains a 1,048,576-token context and 1,024 schedule
 The recipes target this model, sm120 hardware, and vLLM version; the [Apache 2.0 license](LICENSE) covers this repository, and model weights retain their upstream terms.
 
 [^8gpu-baseline]: Baseline uses sm120 compatibility fixes, FlashInfer 0.7.1, and `--block-size 64`; stock vLLM failed before inference.
+[^4gpu-baseline]: Baseline includes sm120 compatibility fixes, native FP8 KV-cache handling, grouped FP4 experts, and expert parallelism with DSpark disabled; the DSpark reference adds three adaptive draft tokens.

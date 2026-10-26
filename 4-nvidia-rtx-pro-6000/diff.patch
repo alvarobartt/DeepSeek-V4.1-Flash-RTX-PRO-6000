@@ -1,0 +1,1418 @@
+--- a/vllm/distributed/device_communicators/cuda_communicator.py
++++ b/vllm/distributed/device_communicators/cuda_communicator.py
+@@ -112,6 +112,12 @@
+             if is_symmetric_memory_enabled():
+                 register_nccl_symmetric_ops(self.pynccl_comm)
+ 
++        self.sm120_host_ar_comm = None
++        if unique_name.split(":")[0] == "tp" and self.world_size == 8:
++            from .sm120_host_all_reduce import Sm120HostAllReduce
++
++            self.sm120_host_ar_comm = Sm120HostAllReduce(self.cpu_group, self.device)
++
+         self.ca_comm: CustomAllreduce | None = None
+         self.qr_comm: QuickAllReduce | None = None
+         self.symm_mem_comm: SymmMemCommunicator | None = None
+@@ -294,6 +300,7 @@
+         depends on the input tensor.
+         """
+         all_potential_ar_backends = [
++            "SM120_HOST_LL",
+             "FLASHINFER_PCIE_IPC",
+             "FLASHINFER",
+             "NCCL_SYMM_MEM",
+@@ -304,6 +311,8 @@
+             "PYNCCL",
+         ]
+         enabled_ar_backends: list[str] = []
++        if self.sm120_host_ar_comm is not None and not self.sm120_host_ar_comm.disabled:
++            enabled_ar_backends.append("SM120_HOST_LL")
+         if (
+             self.fi_pcie_ipc_ar_comm is not None
+             and not self.fi_pcie_ipc_ar_comm.disabled
+@@ -360,6 +369,9 @@
+         )
+ 
+     def all_reduce(self, input_):
++        host_ar = self.sm120_host_ar_comm
++        if host_ar is not None and host_ar.should_use(input_):
++            return host_ar.all_reduce(input_)
+         fi_ar_comm = self.fi_ar_comm
+         use_fi_ar = (
+             fi_ar_comm is not None
+@@ -804,6 +816,9 @@
+             raise ValueError("No PyNCCL communicator found")
+ 
+     def destroy(self):
++        if self.sm120_host_ar_comm is not None:
++            self.sm120_host_ar_comm.destroy()
++            self.sm120_host_ar_comm = None
+         if self.pynccl_comm is not None:
+             self.pynccl_comm.destroy()
+             self.pynccl_comm = None
+--- /dev/null
++++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.cu
+@@ -0,0 +1,142 @@
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++__global__ void publish_host(const uint32_t* input, uint64_t* shared,
++                             uint32_t* counter, int words, int stride, int rank) {
++    __shared__ uint32_t epoch;
++    if (threadIdx.x == 0) epoch = atomicAdd(counter, 1u) + 1u;
++    __syncthreads();
++    uint64_t* slot = shared + size_t(epoch & 1u) * 8 * stride;
++    for (int i = threadIdx.x; i < words; i += blockDim.x) {
++        uint64_t packet = (uint64_t(epoch) << 32) | input[i];
++        uint64_t* address = slot + size_t(rank) * stride + i;
++        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(packet) : "memory");
++    }
++    __threadfence_system();
++}
++
++__global__ void reduce_scatter_host(const uint32_t* input, uint32_t* output,
++                            uint64_t* shared, const uint32_t* counter, int* error,
++                            int words, int stride, int rank) {
++    if (*error) return;
++    __shared__ uint32_t values[8][32];
++    const int lane = threadIdx.x & 31;
++    const int peer = threadIdx.x / 32;
++    const int chunk = (words + 7) / 8;
++    const int end = min((rank + 1) * chunk, words);
++    const int i = rank * chunk + blockIdx.x * 32 + lane;
++    const uint32_t epoch = *counter;
++    uint64_t* slot = shared + size_t(epoch & 1u) * 8 * stride;
++    uint32_t value = 0;
++    if (i < end) {
++        if (peer == rank) value = input[i];
++        else {
++            const uint64_t* address = slot + size_t(peer) * stride + i;
++            const uint64_t deadline = clock64() + 5000000000ull;
++            uint64_t packet;
++            do {
++                asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(packet) : "l"(address) : "memory");
++                if (uint32_t(packet >> 32) != epoch && clock64() > deadline) {
++                    if (atomicCAS(error, 0, peer + 1) == 0) {
++                        error[1] = i; error[2] = uint32_t(packet);
++                        error[3] = uint32_t(packet >> 32); error[4] = epoch;
++                    }
++                    asm volatile("trap;");
++                    return;
++                }
++            } while (uint32_t(packet >> 32) != epoch);
++            value = uint32_t(packet);
++        }
++    }
++    values[peer][lane] = value;
++    __syncthreads();
++    if (peer == 0 && i < end) {
++        float x = 0.0f, y = 0.0f;
++        #pragma unroll
++        for (int source = 0; source < 8; ++source) {
++            uint32_t packed = values[source][lane];
++            __nv_bfloat162 bf;
++            *reinterpret_cast<uint32_t*>(&bf) = packed;
++            float2 pair = __bfloat1622float2(bf);
++            x += pair.x;
++            y += pair.y;
++        }
++        __nv_bfloat162 result = __floats2bfloat162_rn(x, y);
++        const uint32_t packed = *reinterpret_cast<uint32_t*>(&result);
++        output[i] = packed;
++        const uint64_t packet = (uint64_t(epoch ^ 0x80000000u) << 32) | packed;
++        uint64_t* address = slot + size_t(rank) * stride + i;
++        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(packet) : "memory");
++        __threadfence_system();
++    }
++}
++
++__global__ void gather_host_results(uint32_t* output, uint64_t* shared,
++                                    const uint32_t* counter, int* error,
++                                    int words, int stride, int rank) {
++    if (*error) return;
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= words) return;
++    const int chunk = (words + 7) / 8;
++    const int owner = i / chunk;
++    if (owner == rank) return;
++    const uint32_t epoch = *counter;
++    const uint32_t tag = epoch ^ 0x80000000u;
++    const uint64_t* address = shared + size_t(epoch & 1u) * 8 * stride + size_t(owner) * stride + i;
++    const uint64_t deadline = clock64() + 5000000000ull;
++    uint64_t packet;
++    do {
++        asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(packet) : "l"(address) : "memory");
++        if (uint32_t(packet >> 32) != tag && clock64() > deadline) {
++            if (atomicCAS(error, 0, owner + 1) == 0) {
++                error[1] = i; error[2] = uint32_t(packet);
++                error[3] = uint32_t(packet >> 32); error[4] = tag;
++            }
++            asm volatile("trap;");
++            return;
++        }
++    } while (uint32_t(packet >> 32) != tag);
++    output[i] = uint32_t(packet);
++}
++
++extern "C" int register_host(void* host, size_t bytes, int device, void** mapped) {
++    cudaError_t e = cudaSetDevice(device);
++    if (e != cudaSuccess) return e;
++    e = cudaHostRegister(host, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped);
++    if (e != cudaSuccess) return e;
++    return cudaHostGetDevicePointer(mapped, host, 0);
++}
++extern "C" int unregister_host(void* host) { return cudaHostUnregister(host); }
++extern "C" const char* error_text(int code) { return cudaGetErrorString(cudaError_t(code)); }
++extern "C" int launch_host_ll(void* input, void* output, void* shared,
++                              void* counter, void* error, int words, int stride,
++                              int rank, int threads, void* stream) {
++    auto s = reinterpret_cast<cudaStream_t>(stream);
++    publish_host<<<1, 1024, 0, s>>>(static_cast<uint32_t*>(input),
++        static_cast<uint64_t*>(shared), static_cast<uint32_t*>(counter), words, stride, rank);
++    cudaError_t result = cudaGetLastError();
++    if (result != cudaSuccess) return result;
++    const int chunk = (words + 7) / 8;
++    const int blocks = (chunk + 31) / 32;
++    reduce_scatter_host<<<blocks ? blocks : 1, 256, 0, s>>>(
++        static_cast<uint32_t*>(input), static_cast<uint32_t*>(output),
++        static_cast<uint64_t*>(shared), static_cast<uint32_t*>(counter),
++        static_cast<int*>(error), words, stride, rank);
++    result = cudaGetLastError();
++    if (result != cudaSuccess) return result;
++    const int gather_blocks = (words + 127) / 128;
++    gather_host_results<<<gather_blocks ? gather_blocks : 1, 128, 0, s>>>(
++        static_cast<uint32_t*>(output), static_cast<uint64_t*>(shared),
++        static_cast<uint32_t*>(counter), static_cast<int*>(error), words, stride, rank);
++    return cudaGetLastError();
++}
++
++extern "C" int prepare_kernel() {
++    cudaFuncAttributes a;
++    cudaError_t e = cudaFuncGetAttributes(&a, publish_host);
++    if (e != cudaSuccess) return e;
++    e = cudaFuncGetAttributes(&a, reduce_scatter_host);
++    if (e != cudaSuccess) return e;
++    return cudaFuncGetAttributes(&a, gather_host_results);
++}
+--- /dev/null
++++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.py
+@@ -0,0 +1,101 @@
++import ctypes
++import mmap
++import os
++import uuid
++
++import torch
++import torch.distributed as dist
++
++from vllm.distributed.parallel_state import in_the_same_node_as
++from vllm.platforms import current_platform
++
++
++class Sm120HostAllReduce:
++    def __init__(self, group, device):
++        self.disabled = True
++        self.mapping = None
++        self.device = torch.device(device)
++        self.rank = dist.get_rank(group)
++        library = '/usr/local/lib/libvllm-sm120-host-ll.so'
++        if dist.get_world_size(group) != 8 or not os.path.isfile(library):
++            return
++        if not current_platform.is_device_capability_family(120):
++            return
++        if not all(in_the_same_node_as(group, source_rank=0)):
++            return
++        self.lib = ctypes.CDLL(library)
++        self.lib.register_host.argtypes = [
++            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
++            ctypes.POINTER(ctypes.c_void_p),
++        ]
++        self.lib.register_host.restype = ctypes.c_int
++        self.lib.unregister_host.argtypes = [ctypes.c_void_p]
++        self.lib.error_text.argtypes = [ctypes.c_int]
++        self.lib.error_text.restype = ctypes.c_char_p
++        self.lib.prepare_kernel.restype = ctypes.c_int
++        self.lib.launch_host_ll.argtypes = (
++            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
++        )
++        self.lib.launch_host_ll.restype = ctypes.c_int
++        self.max_rows = 16
++        self.stride = self.max_rows * 5120 // 2
++        size = 2 * 8 * self.stride * 8
++        paths = ['/dev/shm/vllm-sm120-' + uuid.uuid4().hex if self.rank == 0 else None]
++        dist.broadcast_object_list(paths, src=dist.get_process_group_ranks(group)[0], group=group)
++        path = paths[0]
++        if self.rank == 0:
++            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
++            os.ftruncate(fd, size)
++        dist.barrier(group=group)
++        if self.rank != 0:
++            fd = os.open(path, os.O_RDWR)
++        try:
++            self.mapping = mmap.mmap(fd, size, flags=mmap.MAP_SHARED)
++        finally:
++            os.close(fd)
++        for slot in range(2):
++            offset = (slot * 8 + self.rank) * self.stride * 8
++            self.mapping[offset:offset + self.stride * 8] = bytes(self.stride * 8)
++        dist.barrier(group=group)
++        self.host = ctypes.addressof(ctypes.c_char.from_buffer(self.mapping))
++        self.mapped = ctypes.c_void_p()
++        self.check(self.lib.register_host(self.host, size, self.device.index, ctypes.byref(self.mapped)))
++        dist.barrier(group=group)
++        if self.rank == 0:
++            os.unlink(path)
++        self.counter = torch.zeros(1, device=self.device, dtype=torch.int32)
++        self.errors = torch.zeros(8, device=self.device, dtype=torch.int32)
++        self.check(self.lib.prepare_kernel())
++        self.disabled = False
++
++    def check(self, code):
++        if code:
++            raise RuntimeError(self.lib.error_text(code).decode())
++
++    def should_use(self, tensor):
++        return (
++            not self.disabled
++            and tensor.device == self.device
++            and tensor.dtype == torch.bfloat16
++            and tensor.is_contiguous()
++            and tensor.ndim == 2
++            and tensor.shape[-1] == 5120
++            and 1 <= tensor.shape[0] <= self.max_rows
++        )
++
++    def all_reduce(self, tensor):
++        output = torch.empty_like(tensor)
++        self.check(self.lib.launch_host_ll(
++            tensor.data_ptr(), output.data_ptr(), self.mapped.value,
++            self.counter.data_ptr(), self.errors.data_ptr(), tensor.numel() // 2,
++            self.stride, self.rank, 128, torch.cuda.current_stream().cuda_stream,
++        ))
++        return output
++
++    def destroy(self):
++        if self.mapping is not None:
++            torch.cuda.synchronize(self.device)
++            self.check(self.lib.unregister_host(self.host))
++            self.mapping.close()
++            self.mapping = None
++        self.disabled = True
+--- /dev/null
++++ b/vllm/distributed/nccl_tuner.cc
+@@ -0,0 +1,43 @@
++#include <cmath>
++#include <cstdlib>
++#include "nccl_tuner.h"
++
++struct Context {
++    bool enabled;
++};
++
++static ncclResult_t init(size_t ranks, size_t nodes, ncclDebugLogger_t log, void** context) {
++    auto* state = static_cast<Context*>(std::malloc(sizeof(Context)));
++    if (state == nullptr) return ncclSystemError;
++    state->enabled = ranks == 8 && nodes == 1;
++    *context = state;
++    if (state->enabled && log != nullptr) {
++        log(NCCL_LOG_INFO, NCCL_TUNING, __FILE__, __LINE__, "TUNER/sm120: small all-reduce Tree policy enabled");
++    }
++    return ncclSuccess;
++}
++
++static ncclResult_t tune(void* context, ncclFunc_t function, size_t bytes, int,
++                        float** costs, int algorithms, int protocols, int, int*) {
++    auto* state = static_cast<Context*>(context);
++    if (state == nullptr || !state->enabled || function != ncclFuncAllReduce ||
++        bytes > 65536 || algorithms <= NCCL_ALGO_TREE || protocols < 1) return ncclSuccess;
++    auto* table = reinterpret_cast<float*>(costs);
++    int best = -1;
++    for (int protocol = 0; protocol < protocols; ++protocol) {
++        int index = NCCL_ALGO_TREE * protocols + protocol;
++        if (table[index] >= 0.0f && std::isfinite(table[index]) &&
++            (best < 0 || table[index] < table[best])) best = index;
++    }
++    if (best >= 0) table[best] = 0.0f;
++    return ncclSuccess;
++}
++
++static ncclResult_t destroy(void* context) {
++    std::free(context);
++    return ncclSuccess;
++}
++
++extern "C" {
++    ncclTuner_v4_t ncclTunerPlugin_v4 = {"sm120-small-allreduce", init, tune, destroy};
++}
+--- a/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
++++ b/vllm/model_executor/kernels/attention/dsa/candidate_blocks.py
+@@ -136,6 +136,42 @@
+         -float("inf"),
+         (cols < width) & ~(valid & keep),
+     )
++
++
++@triton.jit(do_not_specialize=["width", "nblocks"])
++def _mask_visible_candidates_kernel(
++    logits,
++    starts,
++    ends,
++    flags,
++    stride_row,
++    stride_col,
++    stride_start,
++    stride_end,
++    width,
++    nblocks,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_STARTS: tl.constexpr,
++    ROW_REPEAT: tl.constexpr,
++    TILE: tl.constexpr,
++):
++    row = tl.program_id(0).to(tl.int64)
++    start = tl.load(starts + row // ROW_REPEAT * stride_start) if HAS_STARTS else 0
++    end = tl.minimum(tl.load(ends + row // ROW_REPEAT * stride_end), width)
++    edge = tl.load(flags + row * (nblocks + 1) + nblocks)
++    first = tl.maximum(start, 0) + tl.program_id(1) * TILE
++    step = tl.num_programs(1) * TILE
++    for offset in range(first, end, step):
++        cols = offset + tl.arange(0, TILE)
++        valid = cols < end
++        block = (cols - start) // BLOCK_SIZE
++        keep = tl.load(flags + row * (nblocks + 1) + block, valid, other=0)
++        keep = (keep != 0) | ((cols == width - 1) & (edge != 0))
++        tl.store(
++            logits + row * stride_row + cols * stride_col,
++            -float("inf"),
++            valid & ~keep,
++        )
+ 
+ 
+ def select_candidate_blocks(
+@@ -196,6 +232,7 @@
+     candidate_blocks: torch.Tensor,
+     block_size: int,
+     row_repeat: int = 1,
++    mask_outside_bounds: bool = True,
+ ) -> None:
+     """Mask packed logits outside causal bounds and request-local candidates."""
+     assert logits.is_cuda
+@@ -218,7 +255,12 @@
+         row_ks is not None,
+         row_repeat,
+     )
+-    _mask_candidates_kernel[(rows, triton.cdiv(width, 1024))](
++    tiles = triton.cdiv(width, 1024)
++    kernel = _mask_candidates_kernel
++    if not mask_outside_bounds:
++        kernel = _mask_visible_candidates_kernel
++        tiles = min(tiles, max(16, triton.cdiv(1024, rows)))
++    kernel[(rows, tiles)](
+         logits,
+         row_ks,
+         row_ke,
+--- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+@@ -465,6 +465,10 @@
+         assert not quant_config.per_out_ch_quant
+ 
+         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
++        self._sm120_small_moe = (
++            current_platform.is_device_capability_family(120)
++            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
++        )
+ 
+     @staticmethod
+     def activation_format() -> mk.FusedMoEActivationFormat:
+@@ -613,6 +617,28 @@
+         assert self.w1_scale is not None
+         assert self.w2_scale is not None
+ 
++        if (
++            self._sm120_small_moe
++            and 0 < hidden_states.size(0) <= 96
++            and hidden_states.dtype == torch.float8_e4m3fn
++            and w1.shape == (48, 4608, 2560)
++            and w2.shape == (48, 5120, 1152)
++            and self.w1_scale.dtype == torch.int32
++            and self.w2_scale.dtype == torch.int32
++            and topk_ids.size(1) == 6
++            and activation == MoEActivation.SILU
++            and not apply_router_weight_on_input
++        ):
++            from vllm.model_executor.layers.fused_moe.experts.sm120_small_moe import (
++                small_moe,
++            )
++
++            small_moe(
++                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                expert_map, a1q_scale, workspace2,
++            )
++            return
++
+         a1q = hidden_states
+         _, N, _ = w1.size()
+         # K comes from activations (full hidden dim), not from w1 which is
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_grouped_moe.py
+@@ -0,0 +1,230 @@
++import torch
++import triton
++import triton.language as tl
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
++    make_mxfp8_q0_route_workspace,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import (
++    route_assign_decode_kernel,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import (
++    SF_M_ALIGN,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import (
++    cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
++)
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++
++@triton.jit
++def _map_ids(IDS, MAP, LOCAL, N: tl.constexpr, BLOCK: tl.constexpr):
++    r = tl.arange(0, BLOCK)
++    expert = tl.load(IDS + r, r < N, -1)
++    local = tl.load(MAP + expert, (r < N) & (expert >= 0), -1)
++    tl.store(LOCAL + r, local, r < N)
++
++
++@triton.jit
++def _copy_quantized(
++    X,
++    XS,
++    DST,
++    SFDST,
++    Q,
++    SF,
++    K: tl.constexpr,
++    TOPK: tl.constexpr,
++    XS0: tl.constexpr,
++    XS1: tl.constexpr,
++    SF0: tl.constexpr,
++    SF1: tl.constexpr,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    block = tl.program_id(1)
++    token = route // TOPK
++    dest = tl.load(DST + route)
++    sfrow = tl.load(SFDST + route)
++    cols = block * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + token * K + cols, cols < K, 0)
++    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
++    for part in tl.static_range(BLOCK // 512):
++        word = block * (BLOCK // 512) + part
++        if PACKED_XS:
++            scale = tl.load(
++                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
++            )
++        else:
++            scale = tl.full((), 0, tl.int32)
++            for group in tl.static_range(4):
++                sf = tl.load(
++                    XS + token * XS0 + (word * 4 + group) * XS1,
++                    word * 4 + group < triton.cdiv(K, 128),
++                    0,
++                )
++                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++                scale = scale | exponent << group * 8
++        tl.store(
++            SF + word * SF0 + sfrow * SF1,
++            scale,
++            (word < triton.cdiv(K, 512)) & (dest >= 0),
++        )
++
++
++@triton.jit
++def _copy_scales(
++    XS,
++    DST,
++    SFDST,
++    SF,
++    K: tl.constexpr,
++    XS0: tl.constexpr,
++    XS1: tl.constexpr,
++    SF0: tl.constexpr,
++    SF1: tl.constexpr,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    source = tl.load(DST + route)
++    dest = tl.load(SFDST + route)
++    word = tl.arange(0, BLOCK)
++    valid = (source >= 0) & (word < triton.cdiv(K, 512))
++    if PACKED_XS:
++        scale = tl.load(XS + source * XS0 + word * XS1, valid, 0)
++    else:
++        scale = tl.full((BLOCK,), 0, tl.int32)
++        for group in tl.static_range(4):
++            sf = tl.load(
++                XS + source * XS0 + (word * 4 + group) * XS1,
++                (source >= 0) & (word * 4 + group < triton.cdiv(K, 128)),
++                0,
++            )
++            exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++            scale = scale | exponent << group * 8
++    tl.store(SF + word * SF0 + dest * SF1, scale, valid)
++
++
++@triton.jit
++def _reduce(Y, DST, RW, OUT, K: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    value = tl.full((BLOCK,), 0, tl.float32)
++    for slot in range(TOPK):
++        row = tl.load(DST + token * TOPK + slot)
++        weight = tl.load(RW + token * TOPK + slot)
++        x = tl.load(Y + row * K + cols, (row >= 0) & (cols < K), 0).to(tl.float32)
++        value += x * weight
++    tl.store(OUT + token * K + cols, value, cols < K)
++
++
++def prepare(experts, w1, w2):
++    source = (experts.w1_scale.data_ptr(), experts.w2_scale.data_ptr())
++    if getattr(experts, "_sm120_grouped_source", None) != source:
++        experts._sm120_grouped_scales = (
++            experts.w1_scale.permute(0, 2, 1).contiguous(),
++            experts.w2_scale.permute(0, 2, 1).contiguous(),
++        )
++        experts._sm120_grouped_source = source
++
++
++def small_moe(
++    experts,
++    output,
++    x,
++    w1,
++    w2,
++    weights,
++    ids,
++    expert_map,
++    x_scale,
++    workspace,
++    bn=4,
++    bk=256,
++):
++    prepare(experts, w1, w2)
++    b, ds = experts._sm120_grouped_scales
++    a, down = (w1, w2)
++    m, k = x.shape
++    topk = ids.shape[1]
++    pairs = ids.numel()
++    mapped = torch.empty_like(ids)
++    _map_ids[1,](
++        ids, expert_map, mapped, pairs, triton.next_power_of_2(pairs), num_warps=4
++    )
++    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
++    total_scale = route.scale_out.numel()
++    route_block = max(256, triton.next_power_of_2(pairs))
++    grid = max(w1.shape[0], pairs, triton.cdiv(total_scale, route_block))
++    route_assign_decode_kernel[grid,](
++        mapped,
++        weights,
++        route.offsets,
++        route.token_map,
++        route.token_weights,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.scale_out,
++        pairs,
++        topk,
++        w1.shape[0],
++        SF_M_ALIGN,
++        route_block,
++        total_scale,
++        route.scale_out.shape[1],
++        *route.scale_out.stride(),
++        num_warps=4,
++    )
++    _copy_quantized[pairs, triton.cdiv(k, 1024)](
++        x.view(torch.uint8),
++        x_scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.q_out.view(torch.uint8),
++        route.scale_out,
++        k,
++        topk,
++        *x_scale.stride(),
++        *route.scale_out.stride(),
++        x_scale.dtype == torch.int32,
++        1024,
++        num_warps=4,
++    )
++    tile = (8 if m <= 48 else 32, 128, 128)
++    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
++        route.q_out, route.scale_out, a, b, route.offsets, tile=tile, tune=False
++    )
++    intermediate = w1.shape[1] // 2
++    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    sf2 = torch.zeros(
++        (triton.cdiv(intermediate, 512), route.scale_out.shape[1]),
++        device=x.device,
++        dtype=torch.int32,
++    )
++    _copy_scales[pairs,](
++        scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        sf2,
++        intermediate,
++        *scale.stride(),
++        *sf2.stride(),
++        scale.dtype == torch.int32,
++        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
++        num_warps=4,
++    )
++    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tile=tile, tune=False)
++    _reduce[m, triton.cdiv(k, 256)](
++        y,
++        route.dst_rows,
++        weights,
++        output,
++        k,
++        topk,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return output
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
+@@ -0,0 +1,133 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _fp8_pair(packed):
++    return tl.inline_asm_elementwise(
++        "cvt.rn.f16x2.e4m3x2 $0, $1;", constraints="=r,h",
++        args=[packed], dtype=tl.int32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _dot_pair(x, packed):
++    return tl.inline_asm_elementwise(
++        "{ .reg .b32 w, p; .reg .b16 lo, hi; .reg .b8 f4, z; .reg .f32 a, b; "
++        "mov.b16 {f4, z}, $2; cvt.rn.f16x2.e2m1x2 w, f4; "
++        "mul.rn.f16x2 p, w, $1; mov.b32 {lo, hi}, p; "
++        "cvt.f32.f16 a, lo; cvt.f32.f16 b, hi; add.f32 $0, a, b; }",
++        constraints="=f,r,h", args=[x, packed.to(tl.uint16)],
++        dtype=tl.float32, is_pure=True, pack=1)
++
++
++@triton.jit
++def _scale(S, row, k, S0: tl.constexpr, S1: tl.constexpr, PACKED: tl.constexpr, LENGTH: tl.constexpr):
++    if PACKED:
++        word = tl.load(S + row * S0 + (k // 512) * S1, k < LENGTH, 0)
++        exponent = (word >> (((k // 128) % 4) * 8)) & 255
++        return (exponent.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++    else:
++        return tl.load(S + row * S0 + (k // 128) * S1, k < LENGTH, 0).to(tl.float32)
++
++
++@triton.jit
++def _fc1(X, XS, W, WS, IDS, MAP, Y,
++         K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
++         X0: tl.constexpr, XS0: tl.constexpr, XS1: tl.constexpr,
++         W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
++         S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
++         IDS0: tl.constexpr, IDS1: tl.constexpr,
++         HAS_MAP: tl.constexpr, PACKED_XS: tl.constexpr,
++         BN: tl.constexpr, BK: tl.constexpr):
++    route = tl.program_id(0)
++    token = route // TOPK
++    slot = route % TOPK
++    expert = tl.load(IDS + token * IDS0 + slot * IDS1)
++    if HAS_MAP:
++        expert = tl.load(MAP + expert, expert >= 0, -1)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    gate = tl.full((BN, BK), 0, tl.float32)
++    up = tl.full((BN, BK), 0, tl.float32)
++    if expert >= 0:
++        for block in range(triton.cdiv(K, 2 * BK)):
++            p = block * BK + tl.arange(0, BK)
++            k = 2 * p
++            x = _fp8_pair(tl.load(X + token * X0 + p, k < K, 0))
++            xs = _scale(XS, token, k, XS0, XS1, PACKED_XS, K)
++            a = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
++            b = tl.load(W + expert * W0 + (n[:, None] + I) * W1 + (k[None, :] // 2) * W2, (n[:, None] < I) & (k[None, :] < K), 0).to(tl.int32)
++            sa = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
++            sb = tl.load(WS + expert * S0 + (n[:, None] + I) * S1 + (k[None, :] // 128) * S2, (n[:, None] < I) & (k[None, :] < K), 0)
++            sa = (sa >> (((k[None, :] // 32) & 3) * 8)) & 255
++            sb = (sb >> (((k[None, :] // 32) & 3) * 8)) & 255
++            sa = (sa.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++            sb = (sb.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++            gate += _dot_pair(x[None, :], a) * (xs[None, :] * sa)
++            up += _dot_pair(x[None, :], b) * (xs[None, :] * sb)
++    g = tl.sum(gate, 1)
++    u = tl.sum(up, 1)
++    tl.store(Y + route * (2 * I) + n, g, n < I)
++    tl.store(Y + route * (2 * I) + I + n, u, n < I)
++
++
++@triton.jit
++def _fc2_reduce(X, XS, W, WS, IDS, MAP, RW, Y,
++                K: tl.constexpr, I: tl.constexpr, TOPK: tl.constexpr,
++                XS0: tl.constexpr, XS1: tl.constexpr,
++                W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
++                S0: tl.constexpr, S1: tl.constexpr, S2: tl.constexpr,
++                IDS0: tl.constexpr, IDS1: tl.constexpr,
++                RW0: tl.constexpr, RW1: tl.constexpr,
++                HAS_MAP: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
++    token = tl.program_id(0)
++    n = tl.program_id(1) * BN + tl.arange(0, BN)
++    result = tl.full((BN,), 0, tl.float32)
++    for slot in range(TOPK):
++        expert = tl.load(IDS + token * IDS0 + slot * IDS1)
++        if HAS_MAP:
++            expert = tl.load(MAP + expert, expert >= 0, -1)
++        if expert >= 0:
++            total = tl.full((BN, BK), 0, tl.float32)
++            route = token * TOPK + slot
++            for block in range(triton.cdiv(I, 2 * BK)):
++                p = block * BK + tl.arange(0, BK)
++                k = 2 * p
++                x = _fp8_pair(tl.load(X + route * (I // 2) + p, k < I, 0))
++                xs = _scale(XS, route, k, XS0, XS1, True, I)
++                w = tl.load(W + expert * W0 + n[:, None] * W1 + (k[None, :] // 2) * W2, (n[:, None] < K) & (k[None, :] < I), 0).to(tl.int32)
++                s = tl.load(WS + expert * S0 + n[:, None] * S1 + (k[None, :] // 128) * S2, (n[:, None] < K) & (k[None, :] < I), 0)
++                s = (s >> (((k[None, :] // 32) & 3) * 8)) & 255
++                s = (s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
++                total += _dot_pair(x[None, :], w) * (xs[None, :] * s)
++            value = tl.sum(total, 1).to(tl.bfloat16).to(tl.float32)
++            weight = tl.load(RW + token * RW0 + slot * RW1)
++            result += value * weight
++    tl.store(Y + token * K + n, result, n < K)
++
++
++def small_moe(experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace, bn=4, bk=256):
++    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++    m, k = x.shape
++    if m >= 2:
++        from vllm.model_executor.layers.fused_moe.experts.sm120_grouped_moe import (
++            small_moe as grouped_moe,
++        )
++        return grouped_moe(
++            experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace,
++        )
++    intermediate = w1.shape[1] // 2
++    topk = ids.shape[1]
++    projections = workspace.reshape(-1)[:m * topk * 2 * intermediate].view(m * topk, 2 * intermediate)
++    _fc1[(m * topk, triton.cdiv(intermediate, bn))](
++        x.view(torch.uint16), x_scale, w1, experts.w1_scale, ids, expert_map, projections,
++        k, intermediate, topk, x.stride(0) // 2, *x_scale.stride(),
++        *w1.stride(), *experts.w1_scale.stride(), *ids.stride(),
++        expert_map is not None, x_scale.dtype == torch.int32, bn, bk, num_warps=4, enable_fp_fusion=False)
++    quantized = torch.empty((m * topk, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    _fc2_reduce[(m, triton.cdiv(k, bn))](
++        q.view(torch.uint16), scale, w2, experts.w2_scale, ids, expert_map, weights, output,
++        k, intermediate, topk, *scale.stride(), *w2.stride(), *experts.w2_scale.stride(),
++        *ids.stride(), *weights.stride(), expert_map is not None, bn, bk,
++        num_warps=4, enable_fp_fusion=False)
+--- a/vllm/model_executor/layers/sparse_attn_indexer.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer.py
+@@ -41,6 +41,7 @@
+ from vllm.utils.deep_gemm import (
+     fp8_fp4_mqa_logits,
+     fp8_fp4_paged_mqa_logits,
++    get_paged_mqa_logits_metadata,
+     has_deep_gemm,
+ )
+ from vllm.utils.import_utils import has_cutedsl
+@@ -806,84 +807,130 @@
+             if use_fp4_cache
+             else padded_q_quant_decode_tokens
+         )
+-        if current_platform.is_xpu():
+-            if padded_q_scale is not None:
+-                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
+-            seq_lens_xpu = (
+-                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+-            )
+-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+-                padded_q_quant_cast,
+-                kv_cache,
+-                weights[:num_padded_tokens],
+-                seq_lens_xpu,
+-                decode_metadata.block_table,
+-                decode_metadata.schedule_metadata,
+-                max_model_len,
+-            )
+-        else:
+-            logits = fp8_fp4_paged_mqa_logits(
+-                (padded_q_quant_cast, padded_q_scale),
+-                kv_cache,
+-                weights[:num_padded_tokens],
+-                seq_lens,
+-                decode_metadata.block_table,
+-                decode_metadata.schedule_metadata,
+-                max_model_len=max_model_len,
+-                clean_logits=False,
+-                indices=decode_metadata.indices,
+-            )
+-        num_rows = logits.shape[0]
+-        if candidate_blocks is not None:
+-            # Two-level selection (v4.1) on the decode logits; columns are
+-            # request-local compressed positions. seq_lens is (B, next_n)
+-            # for native spec decode (per-row effective lens) and (B, 1)
+-            # otherwise.
+-            vis = seq_lens.reshape(-1)
+-            row_repeat = next_n if vis.numel() != num_rows else 1
+-            vis = vis[:num_rows]
+-            decode_candidates = candidate_blocks[:num_rows]
+-            if candidate_write:
+-                _select_candidate_blocks(
++        bounded_decode = current_platform.is_cuda() and (
++            candidate_blocks is not None
++            or (
++                current_platform.is_device_capability_family(120)
++                and not use_pcp
++                and dcp_world_size == 1
++            )
++        )
++        logits_max_len = max_model_len
++        requests_per_chunk = batch_size
++        if bounded_decode:
++            if (
++                forward_context.cudagraph_runtime_mode != CUDAGraphMode.FULL
++                and not torch.cuda.is_current_stream_capturing()
++            ):
++                logits_max_len = min(
++                    max_model_len, max(topk_tokens, attn_metadata_narrowed.max_seq_len)
++                )
++            logits_stride = ((logits_max_len + 255) // 256) * 256
++            budget = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
++            requests_per_chunk = max(1, budget // (next_n * logits_stride * 4))
++
++        for request_start in range(0, batch_size, requests_per_chunk):
++            request_end = min(batch_size, request_start + requests_per_chunk)
++            row_start, row_end = request_start * next_n, request_end * next_n
++            chunk_seq_lens = seq_lens[request_start:request_end]
++            chunk_indices = (
++                decode_metadata.indices[request_start:request_end]
++                if decode_metadata.indices is not None
++                else None
++            )
++            schedule_metadata = decode_metadata.schedule_metadata
++            if requests_per_chunk < batch_size:
++                schedule_metadata = get_paged_mqa_logits_metadata(
++                    chunk_seq_lens,
++                    kv_cache.shape[1],
++                    schedule_metadata.shape[0] - 1,
++                    indices=chunk_indices,
++                )
++            chunk_q = padded_q_quant_cast[request_start:request_end]
++            chunk_q_scale = (
++                padded_q_scale[request_start:request_end]
++                if padded_q_scale is not None
++                else None
++            )
++            chunk_block_table = decode_metadata.block_table[request_start:request_end]
++            if current_platform.is_xpu():
++                if chunk_q_scale is not None:
++                    raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
++                seq_lens_xpu = (
++                    chunk_seq_lens[:, -1].contiguous()
++                    if chunk_seq_lens.ndim == 2
++                    else chunk_seq_lens
++                )
++                logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
++                    chunk_q,
++                    kv_cache,
++                    weights[row_start:row_end],
++                    seq_lens_xpu,
++                    chunk_block_table,
++                    schedule_metadata,
++                    logits_max_len,
++                )
++            else:
++                logits = fp8_fp4_paged_mqa_logits(
++                    (chunk_q, chunk_q_scale),
++                    kv_cache,
++                    weights[row_start:row_end],
++                    chunk_seq_lens,
++                    chunk_block_table,
++                    schedule_metadata,
++                    max_model_len=logits_max_len,
++                    clean_logits=False,
++                    indices=chunk_indices,
++                )
++            num_rows = logits.shape[0]
++            if candidate_blocks is not None:
++                vis = chunk_seq_lens.reshape(-1)
++                row_repeat = next_n if vis.numel() != num_rows else 1
++                vis = vis[:num_rows]
++                decode_candidates = candidate_blocks[row_start:row_end]
++                if candidate_write:
++                    _select_candidate_blocks(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates.shape[1],
++                        candidate_block_size,
++                        decode_candidates,
++                        row_repeat,
++                    )
++                else:
++                    _apply_candidate_mask(
++                        logits,
++                        None,
++                        vis,
++                        decode_candidates,
++                        candidate_block_size,
++                        row_repeat,
++                        mask_outside_bounds=not (
++                            current_platform.is_device_capability_family(120)
++                        ),
++                    )
++            chunk_topk = topk_indices_buffer[row_start:row_end, :topk_tokens]
++            get_indexer_topk(topk_backend)(
++                logits,
++                chunk_seq_lens,
++                next_n,
++                chunk_topk,
++                topk_tokens,
++                attn_metadata_narrowed.max_seq_len,
++            )
++            if decode_metadata.global_seq_lens is not None:
++                _merge_dcp_topk_global(
+                     logits,
+-                    None,
+-                    vis,
+-                    decode_candidates.shape[1],
+-                    candidate_block_size,
+-                    decode_candidates,
+-                    row_repeat,
+-                )
+-            else:
+-                _apply_candidate_mask(
+-                    logits,
+-                    None,
+-                    vis,
+-                    decode_candidates,
+-                    candidate_block_size,
+-                    row_repeat,
+-                )
++                    chunk_topk,
++                    topk_tokens,
++                    dcp_rank,
++                    dcp_world_size,
++                    cp_kv_cache_interleave_size,
++                )
++            del logits
++
+         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+-
+-        # The backend comes from the layer (config is only readable at model
+-        # construction); dispatchers are cached per backend.
+-        get_indexer_topk(topk_backend)(
+-            logits,
+-            seq_lens,
+-            next_n,
+-            topk_indices,
+-            topk_tokens,
+-            attn_metadata_narrowed.max_seq_len,
+-        )
+-
+-        if decode_metadata.global_seq_lens is not None:
+-            _merge_dcp_topk_global(
+-                logits,
+-                topk_indices,
+-                topk_tokens,
+-                dcp_rank,
+-                dcp_world_size,
+-                cp_kv_cache_interleave_size,
+-            )
+ 
+         if needs_padded_path:
+             # if padded, we need to unpack
+--- a/vllm/models/deepseek_v41/attention.py
++++ b/vllm/models/deepseek_v41/attention.py
+@@ -119,14 +119,14 @@
+     )
+ 
+ 
+-# Which packed fp8_ds_mla record a V4.1 layer writes. FlashMLA decodes
+-# DeepSeek's V4.1 record -- all 512 dims (RoPE included) as fp8 e4m3 with one
+-# UE8M0 scale per 32 dims, 512 data bytes + 16 scale bytes per token, pages
+-# rounded to the kernel's 512 B TMA stride -- only in its SM100 sparse-decode
+-# kernels. Every other arch keeps the V4 record: 448 fp8 NoPE + 64 bf16 RoPE
+-# plus 7 UE8M0 scales of 64 dims and a pad byte (584 B, 576 B pages).
++# FlashMLA on sm100 and FlashInfer on sm120 read the V4.1 record: all 512
++# dims as fp8 with 16 UE8M0 scales and a 512-byte aligned page stride.
++# Other architectures retain the V4 record with a bf16 RoPE tail.
+ def _use_v41_mxfp8_kv_record() -> bool:
+-    return current_platform.is_device_capability_family(100)
++    return (
++        current_platform.is_device_capability_family(100)
++        or current_platform.is_device_capability_family(120)
++    )
+ 
+ 
+ def _resolve_dsv4_kv_cache_dtype(
+--- a/vllm/models/deepseek_v41/compressor.py
++++ b/vllm/models/deepseek_v41/compressor.py
+@@ -24,6 +24,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheSpec
+ 
+@@ -85,7 +86,17 @@
+ 
+ 
+ class CompressorMetadataBuilder(AttentionMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+--- a/vllm/models/deepseek_v41/nvidia/dspark.py
++++ b/vllm/models/deepseek_v41/nvidia/dspark.py
+@@ -24,6 +24,7 @@
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.forward_context import get_forward_context, is_forward_context_available
++from vllm.distributed import tensor_model_parallel_all_gather
+ from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+     mhc_post_tilelang,
+@@ -344,9 +345,42 @@
+         """Base logits U_k = lm_head(norm(head_hidden))."""
+         return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
+ 
+-    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+-        # Full-vocab draft: base logits, no d2t scatter.
+-        return self.compute_logits(hidden_states)
++    def compute_draft_logits(
++        self, hidden_states: torch.Tensor, skip_gather: bool = False
++    ) -> torch.Tensor:
++        return self.logits_processor(
++            self.lm_head, self.model.norm(hidden_states), skip_gather=skip_gather
++        )
++
++    def get_draft_top_tokens(
++        self, base_logits: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor:
++        start = self.lm_head.shard_indices.org_vocab_start_index
++        count = base_logits.shape[-1] - self.lm_head.shard_indices.num_org_vocab_padding
++        processor = self.logits_processor
++        weight = self.model.markov_head.markov_w2.weight[start : start + count]
++        if processor.head_dtype is None or processor.head_dtype == markov_embed.dtype:
++            bias = torch.nn.functional.linear(markov_embed, weight)
++        elif processor.head_dtype == torch.float32:
++            bias = torch.mm(markov_embed, weight.t(), out_dtype=torch.float32)
++        else:
++            bias = self.markov_bias(markov_embed)[:, start : start + count]
++        if processor.head_dtype in (None, markov_embed.dtype, torch.float32):
++            if processor.soft_cap is not None:
++                bias = torch.tanh(bias / processor.soft_cap) * processor.soft_cap
++            if processor.scale != 1.0:
++                bias = bias * processor.scale
++        scores = base_logits[:, :count] + bias
++        values, indices = scores.max(dim=-1)
++        indices = indices + start
++        if self.lm_head.tp_size == 1:
++            return indices
++        dtype = torch.float64 if values.dtype == torch.float64 else torch.float32
++        pairs = torch.stack([values.to(dtype), indices.to(dtype)], dim=-1)
++        gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
++        gathered = gathered.view(base_logits.shape[0], self.lm_head.tp_size, 2)
++        winners = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
++        return gathered[:, :, 1].gather(-1, winners).squeeze(-1).to(torch.int64)
+ 
+     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
+         return draft_ids  # full-vocab: draft ids are target ids
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py
+@@ -25,17 +25,20 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import (
+     AttentionCGSupport,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import (
+     get_dspark_swa_index_width,
+ )
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ 
+ if TYPE_CHECKING:
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+@@ -115,7 +118,7 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [128]
++        return [64 if current_platform.is_device_capability_family(120) else 128]
+ 
+     @staticmethod
+     def get_name() -> str:
+@@ -178,15 +181,35 @@
+ 
+ 
+ class DeepseekV4FlashInferSparseMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    """Varlen-capable metadata builder for the FlashInfer sparse MLA backend."""
+-
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    """Varlen-decode-capable metadata builder for the FlashInfer sparse MLA backend."""
++
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashInferMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashInfer sparse decode path (varlen decode)."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+     def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+@@ -834,6 +857,7 @@
+             bmm1_scale=self.scale,
+             sinks=self.attn_sink,
+             kv_layout="NHD",
++            kv_cache_format="fp8_dsv41",
+             swa_topk_lens=swa_lens,
+             extra_sparse_indices=extra_sparse_indices,
+             extra_sparse_topk_lens=extra_sparse_lengths,
+@@ -949,6 +973,7 @@
+                 bmm1_scale=self.scale,
+                 sinks=self.attn_sink,
+                 kv_layout="NHD",
++                kv_cache_format="fp8_dsv41",
+                 swa_topk_lens=swa_lens_chunk,
+                 extra_sparse_indices=extra_sparse_indices_chunk,
+                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
+--- a/vllm/models/deepseek_v41/nvidia/flashmla.py
++++ b/vllm/models/deepseek_v41/nvidia/flashmla.py
+@@ -5,6 +5,7 @@
+ 
+ import torch
+ 
++from vllm.config import VllmConfig
+ from vllm.forward_context import get_forward_context
+ from vllm.models.deepseek_v4.nvidia.ops.o_proj import compute_fp8_einsum_recipe
+ from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+@@ -23,12 +24,13 @@
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
+ from vllm.utils.math_utils import round_up
+-from vllm.v1.attention.backend import AttentionCGSupport
++from vllm.v1.attention.backend import AttentionCGSupport, max_decode_query_len
+ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+ from vllm.v1.attention.ops.flashmla import (
+     flash_mla_sparse_fwd,
+     flash_mla_with_kvcache,
+ )
++from vllm.v1.kv_cache_interface import KVCacheSpec
+ from vllm.v1.worker.workspace import current_workspace_manager
+ 
+ if TYPE_CHECKING:
+@@ -38,7 +40,17 @@
+ class DeepseekSparseSWAFlashMLAMetadataBuilder(DeepseekV41SparseSWAMetadataBuilder):
+     """SWA metadata for the FlashMLA decode path, which allows varlen decode."""
+ 
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekSparseSWAFlashMLABackend(DeepseekSparseSWABackend):
+--- a/vllm/models/deepseek_v41/sparse_mla.py
++++ b/vllm/models/deepseek_v41/sparse_mla.py
+@@ -18,6 +18,7 @@
+     AttentionMetadataBuilder,
+     CommonAttentionMetadata,
+     MultipleOf,
++    max_decode_query_len,
+ )
+ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
+ from vllm.v1.attention.backends.mla.sparse_swa import (
+@@ -26,7 +27,7 @@
+     _LAYER_TYPE_SWAONLY,
+     DeepseekSparseSWAMetadataBuilder,
+ )
+-from vllm.v1.kv_cache_interface import AttentionSpec
++from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+ 
+ # v4.1 per-layer compress ratios: 0 = pure sliding window, 1 = full-length
+ # compressed cache, 2 = ratio-2 compressed cache. Ratio-1 and ratio-2 layers
+@@ -87,7 +88,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+     @staticmethod
+     def get_builder_cls() -> type["DeepseekV4SparseMLAMetadataBuilder"]:
+@@ -219,7 +224,17 @@
+ 
+ 
+ class DeepseekV4FlashMLAMetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
+-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
++    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
++
++    @classmethod
++    def get_varlen_cudagraph_max_query_len(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: KVCacheSpec,
++    ) -> int | None:
++        # Decode replays use device request boundaries; prefill metadata is
++        # not graph-safe.
++        return max_decode_query_len(vllm_config)
+ 
+ 
+ class DeepseekV4FlashMLABackend(DeepseekV4SparseMLABackend):
+--- a/vllm/v1/attention/backends/mla/indexer.py
++++ b/vllm/v1/attention/backends/mla/indexer.py
+@@ -369,7 +369,11 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int | MultipleOf]:
+-        return [64 if current_platform.is_device_capability_family(90) else 128]
++        small_pages = (
++            current_platform.is_device_capability_family(90)
++            or current_platform.is_device_capability_family(120)
++        )
++        return [64 if small_pages else 128]
+ 
+ 
+ @dataclass(frozen=True)
+@@ -932,7 +936,10 @@
+ def _supports_varlen_paged_mqa_logits() -> bool:
+     return (
+         current_platform.is_cuda()
+-        and current_platform.is_device_capability_family(100)
++        and (
++            current_platform.is_device_capability_family(100)
++            or current_platform.is_device_capability_family(120)
++        )
+         and has_deep_gemm()
+     )
+ 
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -113,6 +113,20 @@
+             self.use_acceptance_estimator = False
+         return model
+ 
++    def _validate_local_argmax_reduction(self) -> None:
++        if not self.use_local_argmax_reduction:
++            return
++        if (
++            self.draft_logits is not None
++            or self._draft_topk is not None
++            or not hasattr(self.model, "get_draft_top_tokens")
++        ):
++            raise ValueError(
++                "Local DSpark argmax requires a supported full-vocabulary "
++                "draft model, greedy drafting, and no draft top-k truncation."
++            )
++        logger.info("Using vocabulary-parallel argmax for DSpark Markov sampling.")
++
+     def _sample_logits(
+         self,
+         logits: torch.Tensor,
+@@ -164,7 +178,10 @@
+         # Per-(req, position) head hidden, ordered (req, step).
+         sample_hidden = head_hidden[self.sample_indices[:num_sample]]
+         # Draft-vocab logits; sampled ids are remapped to target vocab below.
+-        base_logits = self.model.compute_draft_logits(sample_hidden)
++        if self.use_local_argmax_reduction:
++            base_logits = self.model.compute_draft_logits(sample_hidden, skip_gather=True)
++        else:
++            base_logits = self.model.compute_draft_logits(sample_hidden)
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+ 
+@@ -181,11 +198,16 @@
+             markov_embed = self.model.markov_embed(prev)
+             if self.use_confidence_head:
+                 confidence_markov_embeds.append(markov_embed)
+-            bias = self.model.markov_bias(markov_embed)
+-            logits_i = base_logits[:, i] + bias
+-            draft_sampled_i = self._sample_logits(
+-                logits_i, idx_map[:, i], sample_pos[:, i], i
+-            )
++            if self.use_local_argmax_reduction:
++                draft_sampled_i = self.model.get_draft_top_tokens(
++                    base_logits[:, i], markov_embed
++                )
++            else:
++                bias = self.model.markov_bias(markov_embed)
++                logits_i = base_logits[:, i] + bias
++                draft_sampled_i = self._sample_logits(
++                    logits_i, idx_map[:, i], sample_pos[:, i], i
++                )
+             self.draft_tokens[:num_reqs, i] = draft_sampled_i
+             prev = draft_sampled_i
+ 

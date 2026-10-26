@@ -70,4 +70,4 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 14 | Grouped expert GEMMs | 209.0 | [`3f93e68`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/3f93e6858c94c6eee506cd5331e23bde65f6e38b) |
 | 15 | Wider grouped experts | 209.9 | [`a2b480a`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a2b480a3526a3a235f7113b630650516733f658f) |
 | 16 | Sharded draft sampling | 211.3 | [`e36008c`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/e36008c9f6a7cd5c1cb9f55e8082ede7341164e5) |
-| 17 | Medium grouped experts | 211.7 | This revision |
+| 17 | Medium grouped experts | 211.7 | [`ba418b9`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/ba418b932c779f5224cc2657e52a769112cf0917) |
