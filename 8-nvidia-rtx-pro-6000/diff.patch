@@ -431,7 +431,7 @@
  
 +        if (
 +            self._sm120_small_moe
-+            and 0 < hidden_states.size(0) <= 16
++            and 0 < hidden_states.size(0) <= 96
 +            and hidden_states.dtype == torch.float8_e4m3fn
 +            and w1.shape == (48, 4608, 2560)
 +            and w2.shape == (48, 5120, 1152)
@@ -456,7 +456,7 @@
          # K comes from activations (full hidden dim), not from w1 which is
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/experts/sm120_grouped_moe.py
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,230 @@
 +import torch
 +import triton
 +import triton.language as tl
@@ -614,7 +614,8 @@
 +    )
 +    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
 +    total_scale = route.scale_out.numel()
-+    grid = max(w1.shape[0], pairs, triton.cdiv(total_scale, 256))
++    route_block = max(256, triton.next_power_of_2(pairs))
++    grid = max(w1.shape[0], pairs, triton.cdiv(total_scale, route_block))
 +    route_assign_decode_kernel[grid,](
 +        mapped,
 +        weights,
@@ -628,7 +629,7 @@
 +        topk,
 +        w1.shape[0],
 +        SF_M_ALIGN,
-+        256,
++        route_block,
 +        total_scale,
 +        route.scale_out.shape[1],
 +        *route.scale_out.stride(),
@@ -649,8 +650,9 @@
 +        1024,
 +        num_warps=4,
 +    )
++    tile = (8 if m <= 48 else 32, 128, 128)
 +    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
-+        route.q_out, route.scale_out, a, b, route.offsets, tune=False
++        route.q_out, route.scale_out, a, b, route.offsets, tile=tile, tune=False
 +    )
 +    intermediate = w1.shape[1] // 2
 +    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
@@ -672,7 +674,7 @@
 +        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
 +        num_warps=4,
 +    )
-+    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tune=False)
++    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tile=tile, tune=False)
 +    _reduce[m, triton.cdiv(k, 256)](
 +        y,
 +        route.dst_rows,

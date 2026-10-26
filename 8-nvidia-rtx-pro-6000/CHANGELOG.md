@@ -4,10 +4,10 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 16. Sharded draft sampling
+## 17. Medium grouped experts
 
-- Compute DSpark's logits and Markov bias per vocabulary shard with diff.patch and enable `use_local_argmax_reduction` so GPUs exchange only maximum scores and token IDs.
--    --speculative-config '{"method":"dspark","num_speculative_tokens":3,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true}' \
+- Extend the grouped expert kernels in diff.patch from 16 to 96 tokens to avoid DeepGEMM's 128-row padding for medium batches.
+- Scale routing metadata with the route count and use 8-row GEMM tiles through 48 tokens and 32-row tiles above 48 to keep repeated expert routes efficient.
 
 Requirements, on a fresh vLLM image:
 
@@ -41,14 +41,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 211.3 | 127.7 | 5.77 |
-| 4 | 128 | 527.1 | 104.0 | 9.50 |
-| 8 | 128 | 730.2 | 208.9 | 12.90 |
-| 16 | 128 | 865.6 | 282.0 | 22.64 |
-| 32 | 128 | 1198.6 | 395.2 | 30.31 |
-| 64 | 128 | 1540.4 | 796.1 | 42.77 |
-| 128 | 256 | 2171.9 | 1574.8 | 71.96 |
-| 256 | 512 | 2921.9 | 2585.6 | 136.24 |
+| 1 | 128 | 211.7 | 127.1 | 5.84 |
+| 4 | 128 | 534.8 | 103.3 | 9.22 |
+| 8 | 128 | 748.9 | 203.4 | 12.36 |
+| 16 | 128 | 1005.0 | 270.9 | 18.53 |
+| 32 | 128 | 1341.9 | 385.5 | 26.98 |
+| 64 | 128 | 1649.4 | 748.4 | 39.14 |
+| 128 | 256 | 2194.5 | 1521.9 | 75.64 |
+| 256 | 512 | 2998.3 | 2817.5 | 136.27 |
 
 ## Accepted progress
 
@@ -69,4 +69,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 13 | Wider host reductions | 194.5 | [`2a5cf80`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/2a5cf807aa60bccd4f3ced6a49b39ee1c5f25970) |
 | 14 | Grouped expert GEMMs | 209.0 | [`3f93e68`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/3f93e6858c94c6eee506cd5331e23bde65f6e38b) |
 | 15 | Wider grouped experts | 209.9 | [`a2b480a`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a2b480a3526a3a235f7113b630650516733f658f) |
-| 16 | Sharded draft sampling | 211.3 | This revision |
+| 16 | Sharded draft sampling | 211.3 | [`e36008c`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/e36008c9f6a7cd5c1cb9f55e8082ede7341164e5) |
+| 17 | Medium grouped experts | 211.7 | This revision |
