@@ -4,12 +4,10 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 11. Host all-reduce
+## 12. Host reduce-scatter
 
-- Use mapped host memory in diff.patch for small TP reductions because this node only supports direct GPU peer access within pairs.
-- Publish epoch-tagged values in one CUDA kernel and reduce them across SMs in a second kernel to overlap host-memory reads.
-- Accumulate in FP32 in a fixed rank order so all GPUs receive identical BF16 results.
-- Keep reductions above four rows on NCCL because additional host-memory traffic removes the speedup.
+- Reduce each output slice once and gather the result because having every GPU sum every input repeats host-memory reads.
+- Assign a warp to each peer to overlap host reads while preserving the FP32 rank order and single BF16 rounding.
 
 Requirements, on a fresh vLLM image:
 
@@ -43,14 +41,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 182.1 | 128.0 | 6.68 |
-| 4 | 128 | 390.1 | 113.6 | 12.04 |
-| 8 | 128 | 586.8 | 211.6 | 15.97 |
-| 16 | 128 | 831.9 | 279.2 | 22.38 |
-| 32 | 128 | 1149.4 | 387.2 | 30.58 |
-| 64 | 128 | 1499.0 | 791.4 | 42.86 |
-| 128 | 256 | 2141.8 | 1322.9 | 75.10 |
-| 256 | 512 | 2741.4 | 3677.1 | 219.44 |
+| 1 | 128 | 194.2 | 128.0 | 6.16 |
+| 4 | 128 | 388.3 | 117.8 | 12.90 |
+| 8 | 128 | 581.0 | 211.9 | 16.09 |
+| 16 | 128 | 835.7 | 278.1 | 22.86 |
+| 32 | 128 | 1163.1 | 394.7 | 30.59 |
+| 64 | 128 | 1479.9 | 916.7 | 39.19 |
+| 128 | 256 | 2069.2 | 1334.7 | 68.75 |
+| 256 | 512 | 2794.1 | 2800.4 | 140.68 |
 
 ## Accepted progress
 
@@ -66,4 +64,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 8 | Native FP8 cache | 151.8 | [`a9e6ae8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/a9e6ae8dd71ddca1d6a113493d382719633b3a5c) |
 | 9 | Bounded candidate masking | 152.0 | [`51061a6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/51061a663497d98b907a35da5ddb76048eaacddb) |
 | 10 | Packed FP4 experts | 167.8 | [`9253782`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/92537829d7ce003664a820e67d61e12b39680329) |
-| 11 | Host all-reduce | 182.1 | This revision |
+| 11 | Host all-reduce | 182.1 | [`f00f364`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/f00f36484aed613e5b1a86566f60fdf9b9e78284) |
+| 12 | Host reduce-scatter | 194.2 | This revision |
