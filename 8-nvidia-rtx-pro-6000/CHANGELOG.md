@@ -71,4 +71,4 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 16 | Sharded draft sampling | 211.3 | [`e36008c`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/e36008c9f6a7cd5c1cb9f55e8082ede7341164e5) |
 | 17 | Medium grouped experts | 211.7 | [`ba418b9`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/ba418b932c779f5224cc2657e52a769112cf0917) |
 | 18 | Cold-start guards | 209.3 | [`62b3bf7`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/62b3bf717ce8447cd20c62b06a2bfbe781b6836d) |
-| 19 | Counter-safe collectives | 211.4 | This revision |
+| 19 | Counter-safe collectives | 211.4 | [`b4be2dd`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/b4be2ddcfaf547f6f042d91aac6a104dfabae3a2) |

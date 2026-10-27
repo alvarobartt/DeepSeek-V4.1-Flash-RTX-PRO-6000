@@ -4,9 +4,9 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 2. Ninety-six local experts
+## 3. Four-rank host collectives
 
-- Extend the small-batch expert kernels to 96 local experts because TP4 previously fell back to DeepGEMM's 128-row padding.
+- Move small four-rank reductions through mapped host memory to reduce communication latency on PCIe.
 
 Requirements, on a fresh vLLM image:
 
@@ -41,14 +41,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 161.5 | 134.2 | 7.58 |
-| 4 | 128 | 398.5 | 127.7 | 12.47 |
-| 8 | 128 | 582.3 | 227.3 | 15.83 |
-| 16 | 128 | 798.6 | 284.7 | 23.55 |
-| 32 | 128 | 1126.5 | 498.2 | 32.29 |
-| 64 | 128 | 1354.5 | 876.9 | 54.17 |
-| 128 | 256 | 1850.7 | 1527.0 | 79.03 |
-| 256 | 512 | 2506.8 | 2850.4 | 141.25 |
+| 1 | 128 | 173.8 | 131.1 | 6.94 |
+| 4 | 128 | 415.3 | 120.2 | 11.99 |
+| 8 | 128 | 585.1 | 222.2 | 15.97 |
+| 16 | 128 | 795.0 | 284.3 | 23.20 |
+| 32 | 128 | 1123.8 | 422.6 | 31.43 |
+| 64 | 128 | 1360.5 | 899.4 | 50.91 |
+| 128 | 256 | 1868.0 | 1579.8 | 81.32 |
+| 256 | 512 | 2524.4 | 2957.3 | 138.39 |
 
 ## Accepted progress
 
@@ -57,3 +57,4 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 0 | Four-GPU baseline | 68.9 | [`98e3fb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/98e3fb632bb37dea066d2f7d9cb6f1b4a436cb4d) |
 | 1 | DSpark decoding | 131.3 | [`dee02d3`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/dee02d3567a50684bf4abb462d28390b3c3c9460) |
 | 2 | Ninety-six local experts | 161.5 | [`26ae9ab`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/26ae9abd68d901a24ec36c582ae2c354a34eb81c) |
+| 3 | Four-rank host collectives | 173.8 | This revision |
