@@ -20,4 +20,9 @@ RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
     /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/sm120_host_all_reduce.cu \
     -o /usr/local/lib/libvllm-sm120-host-ll.so
 
+RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+    -gencode arch=compute_120a,code=sm_120a \
+    /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu \
+    -o /usr/local/lib/libvllm-sm120-g2-wo-a-mma.so
+
 ENV NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so

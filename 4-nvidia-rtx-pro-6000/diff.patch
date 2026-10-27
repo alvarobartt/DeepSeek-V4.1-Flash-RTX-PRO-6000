@@ -1462,3 +1462,176 @@
              self.draft_tokens[:num_reqs, i] = draft_sampled_i
              prev = draft_sampled_i
  
+--- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -95,11 +95,14 @@
+         )
+     else:
+         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+-        torch.bmm(
+-            o_proj_input.transpose(0, 1),
+-            grouped_weight.transpose(1, 2),
+-            out=z.transpose(0, 1),
+-        )
++        from vllm.models.deepseek_v4.nvidia.ops.sm120_wo_a_mma import small_g2
++
++        if not small_g2(o_proj_input, grouped_weight, z):
++            torch.bmm(
++                o_proj_input.transpose(0, 1),
++                grouped_weight.transpose(1, 2),
++                out=z.transpose(0, 1),
++            )
+     return wo_b(z.flatten(1))
+ 
+ 
+--- a/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.py
+@@ -0,0 +1,54 @@
++import ctypes
++from functools import lru_cache
++
++import torch
++
++
++@lru_cache(None)
++def _supported_device(device):
++    return (
++        torch.cuda.get_device_capability(device) == (12, 0)
++        and torch.cuda.get_device_properties(device).multi_processor_count == 188
++    )
++
++
++@lru_cache(None)
++def _library():
++    library = ctypes.CDLL("/usr/local/lib/libvllm-sm120-g2-wo-a-mma.so")
++    library.launch_woa.argtypes = [ctypes.c_void_p] * 4 + [
++        ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
++        ctypes.c_int, ctypes.c_void_p,
++    ]
++    library.launch_woa.restype = ctypes.c_int
++    return library
++
++
++def small_g2(x, weight, output):
++    if not (
++        x.is_cuda and weight.device == output.device == x.device
++        and x.dtype == weight.dtype == output.dtype == torch.bfloat16
++        and x.ndim == weight.ndim == output.ndim == 3
++        and 1 <= x.shape[0] <= 4
++        and x.shape[1:] == (2, 4096)
++        and weight.shape == (2, 1024, 4096)
++        and output.shape == (x.shape[0], 2, 1024)
++        and weight.is_contiguous() and output.is_contiguous()
++        and x.stride(-1) == 1
++        and x.stride(0) > 0 and x.stride(0) % 2 == 0
++        and x.stride(1) > 0 and x.stride(1) % 2 == 0
++        and x.data_ptr() % 4 == 0 and weight.data_ptr() % 4 == 0
++        and output.data_ptr() % 2 == 0
++        and _supported_device(x.device)
++    ):
++        return False
++    partial = torch.empty(
++        (16, x.shape[0], 2, 1024), device=x.device, dtype=torch.float32
++    )
++    error = _library().launch_woa(
++        x.data_ptr(), weight.data_ptr(), output.data_ptr(), partial.data_ptr(),
++        x.shape[0], x.stride(0), x.stride(1), 8, 16,
++        torch.cuda.current_stream(x.device).cuda_stream,
++    )
++    if error:
++        raise RuntimeError(f"sm120 G2 BF16 WO-A launch failed: {error}")
++    return True
+--- a/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu
+@@ -0,0 +1,91 @@
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++template<int Warps, int Splits>
++__global__ void woa_bf16_mma(const uint32_t* __restrict__ x,
++        const uint32_t* __restrict__ w, __nv_bfloat16* __restrict__ out,
++        float* __restrict__ partial, int m, int64_t xt, int64_t xg) {
++    const int lane = threadIdx.x & 31;
++    const int group = lane / 4;
++    const int part = lane % 4;
++    const int nbase = (blockIdx.x * Warps + threadIdx.x / 32) * 8;
++    const int batch = blockIdx.y;
++    const int split = blockIdx.z;
++    const int begin = split * (4096 / Splits);
++    const int end = begin + 4096 / Splits;
++    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++    #pragma unroll 2
++    for (int k = begin; k < end; k += 16) {
++        const int kp = k / 2 + part;
++        const uint32_t a0 = group < m ? x[(group * xt + batch * xg) / 2 + kp] : 0;
++        const uint32_t a2 = group < m ? x[(group * xt + batch * xg) / 2 + kp + 4] : 0;
++        const uint32_t b0 = w[(batch * 1024 + nbase + group) * 2048 + kp];
++        const uint32_t b1 = w[(batch * 1024 + nbase + group) * 2048 + kp + 4];
++        asm volatile(
++            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++            : "r"(a0), "r"(uint32_t(0)), "r"(a2), "r"(uint32_t(0)), "r"(b0), "r"(b1));
++    }
++    if (group < m) {
++        const int index = (group * 2 + batch) * 1024 + nbase + 2 * part;
++        if constexpr (Splits == 1) {
++            out[index] = __float2bfloat16_rn(c0);
++            out[index + 1] = __float2bfloat16_rn(c1);
++        } else {
++            const int offset = split * m * 2 * 1024 + index;
++            partial[offset] = c0;
++            partial[offset + 1] = c1;
++        }
++    }
++}
++
++template<int Splits>
++__global__ void woa_mma_reduce(const float* __restrict__ partial,
++                             __nv_bfloat16* __restrict__ out, int count) {
++    const int index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= count) return;
++    float sum = 0;
++    #pragma unroll
++    for (int split = 0; split < Splits; ++split)
++        sum += partial[split * count + index];
++    out[index] = __float2bfloat16_rn(sum);
++}
++
++template<int Warps, int Splits>
++int launch_mma(void* x, void* w, void* out, void* partial, int m,
++               int64_t xt, int64_t xg, cudaStream_t stream) {
++    woa_bf16_mma<Warps, Splits><<<dim3(1024 / (Warps * 8), 2, Splits), Warps * 32, 0, stream>>>(
++        static_cast<const uint32_t*>(x), static_cast<const uint32_t*>(w),
++        static_cast<__nv_bfloat16*>(out), static_cast<float*>(partial), m, xt, xg);
++    cudaError_t error = cudaGetLastError();
++    if (error != cudaSuccess) return int(error);
++    if constexpr (Splits > 1) {
++        const int count = m * 2 * 1024;
++        woa_mma_reduce<Splits><<<(count + 255) / 256, 256, 0, stream>>>(
++            static_cast<const float*>(partial), static_cast<__nv_bfloat16*>(out), count);
++    }
++    return int(cudaGetLastError());
++}
++
++template<int Warps>
++int dispatch_mma(void* x, void* w, void* out, void* partial, int m,
++                 int64_t xt, int64_t xg, int splits, cudaStream_t stream) {
++    if (splits == 1) return launch_mma<Warps, 1>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 2) return launch_mma<Warps, 2>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 4) return launch_mma<Warps, 4>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 8) return launch_mma<Warps, 8>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 16) return launch_mma<Warps, 16>(x, w, out, partial, m, xt, xg, stream);
++    return int(cudaErrorInvalidValue);
++}
++
++extern "C" int launch_woa(void* x, void* w, void* out, void* partial, int m,
++        int64_t xt, int64_t xg, int warps, int splits, void* stream) {
++    if (m < 1 || m > 8 || (xt & 1) || (xg & 1) || xt <= 0 || xg <= 0)
++        return int(cudaErrorInvalidValue);
++    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++    if (warps == 4) return dispatch_mma<4>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
++    if (warps == 8) return dispatch_mma<8>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
++    return int(cudaErrorInvalidValue);
++}
