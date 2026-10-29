@@ -4,22 +4,47 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 19. Counter-safe collectives
+## 20. Compact two-way experts
 
-- Clear reused slots at counter boundaries and track peer readiness separately to prevent stale packets from being read.
+- Split each expert across two GPUs and four expert groups without padding to reduce small-batch expert work.
+- Pass route counts and scale strides at runtime to avoid compiling kernels for each request length.
+- Reduce the prefill budget to 4,096 tokens to limit prefill stalls while retaining the full 1,048,576-token context.
+- Raise GPU memory utilization to 96.5% to preserve KV-cache capacity with the new expert layout.
+-    --enable-expert-parallel
 
 Requirements, on a fresh vLLM image:
 
 ```bash
-python3 -m pip install --no-deps --upgrade flashinfer-python==0.7.1
-python3 -m pip install --no-deps --upgrade flashinfer-cubin==0.7.1 --index-url https://flashinfer.ai/whl
-python3 -m pip install --no-deps --upgrade flashinfer-jit-cache==0.7.1 flashinfer-jit-cache-sm120f==0.7.1 --index-url https://flashinfer.ai/whl/cu130
+python3 -m pip install --no-deps --upgrade \
+    flashinfer-python==0.7.1
+python3 -m pip install --no-deps --upgrade \
+    flashinfer-cubin==0.7.1 \
+    --index-url https://flashinfer.ai/whl
+python3 -m pip install --no-deps --upgrade \
+    flashinfer-jit-cache==0.7.1 \
+    flashinfer-jit-cache-sm120f==0.7.1 \
+    --index-url https://flashinfer.ai/whl/cu130
 vllm_package_dir=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
 patch --batch --forward -p1 -d "$vllm_package_dir/.." < 8-nvidia-rtx-pro-6000/diff.patch
-mkdir -p /tmp/nccl-tuner/tuner \
+nccl_headers=https://raw.githubusercontent.com/NVIDIA/nccl/73cf112295c33aee2b895f329f592f2a9b4b0f97/src/include
+mkdir -p /tmp/nccl-tuner/tuner
+curl -fL "$nccl_headers/plugin/nccl_tuner.h" -o /tmp/nccl-tuner/nccl_tuner.h
+curl -fL "$nccl_headers/nccl_common.h" -o /tmp/nccl-tuner/nccl_common.h
+for nccl_api in 2 3 4 5 6; do
+    curl -fL "$nccl_headers/plugin/tuner/tuner_v${nccl_api}.h" -o "/tmp/nccl-tuner/tuner/tuner_v${nccl_api}.h"
+done
+g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror \
+    -I/tmp/nccl-tuner \
+    -I/usr/local/cuda/include \
+    -I"$vllm_package_dir/../nvidia/nccl/include" \
+    "$vllm_package_dir/distributed/nccl_tuner.cc" \
+    -o /usr/local/lib/libvllm-sm120-tuner.so
 nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+    -gencode arch=compute_120a,code=sm_120a \
+    "$vllm_package_dir/distributed/device_communicators/sm120_host_all_reduce.cu" \
+    -o /usr/local/lib/libvllm-sm120-host-ll.so
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
-export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
+export VLLM_SM120_EXPERT_TP=2
 ```
 
 Then, run server as:
@@ -35,19 +60,21 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --mm-encoder-tp-mode data \
     --block-size 64 \
     --speculative-config '{"method": "dspark", "num_speculative_tokens": 3, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
-    --enable-expert-parallel
+    --enable-expert-parallel \
+    --gpu-memory-utilization 0.965 \
+    --max-num-batched-tokens 4096
 ```
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 211.4 | 127.9 | 5.90 |
-| 4 | 128 | 523.3 | 103.1 | 9.26 |
-| 8 | 128 | 736.2 | 204.3 | 13.12 |
-| 16 | 128 | 1000.1 | 280.8 | 18.36 |
-| 32 | 128 | 1319.1 | 653.6 | 29.17 |
-| 64 | 128 | 1647.7 | 794.4 | 41.00 |
-| 128 | 256 | 2239.7 | 1503.9 | 68.28 |
-| 256 | 512 | 2983.6 | 2660.2 | 135.16 |
+| 1 | 128 | 228.9 | 131.3 | 5.22 |
+| 4 | 128 | 544.2 | 87.8 | 8.43 |
+| 8 | 128 | 786.3 | 212.0 | 12.20 |
+| 16 | 128 | 1069.8 | 281.7 | 17.54 |
+| 32 | 128 | 1428.1 | 385.2 | 24.90 |
+| 64 | 128 | 1812.7 | 826.7 | 49.51 |
+| 128 | 256 | 2379.8 | 1592.0 | 73.78 |
+| 256 | 512 | 3113.4 | 3045.9 | 122.08 |
 
 ## Accepted progress
 
@@ -72,3 +99,4 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 17 | Medium grouped experts | 211.7 | [`ba418b9`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/ba418b932c779f5224cc2657e52a769112cf0917) |
 | 18 | Cold-start guards | 209.3 | [`62b3bf7`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/62b3bf717ce8447cd20c62b06a2bfbe781b6836d) |
 | 19 | Counter-safe collectives | 211.4 | [`b4be2dd`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/b4be2ddcfaf547f6f042d91aac6a104dfabae3a2) |
+| 20 | Compact two-way experts | 228.9 | This revision |
