@@ -4,13 +4,10 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 20. Compact two-way experts
+## 21. Target vocabulary-parallel sampling
 
-- Split each expert across two GPUs and four expert groups without padding to reduce small-batch expert work.
-- Pass route counts and scale strides at runtime to avoid compiling kernels for each request length.
-- Reduce the prefill budget to 4,096 tokens to limit prefill stalls while retaining the full 1,048,576-token context.
-- Raise GPU memory utilization to 96.5% to preserve KV-cache capacity with the new expert layout.
--    --enable-expert-parallel
+- Exchange each vocabulary shard's maximum score and token ID instead of full target logits to reduce communication for eligible greedy requests.
+- Fuse rank reduction, draft verification, and token counts while retaining native sampling for stochastic requests, penalties, logprobs, structured output, and other unsupported modes.
 
 Requirements, on a fresh vLLM image:
 
@@ -45,6 +42,7 @@ nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
     -o /usr/local/lib/libvllm-sm120-host-ll.so
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 export VLLM_SM120_EXPERT_TP=2
+export VLLM_SM120_TARGET_GREEDY=1
 ```
 
 Then, run server as:
@@ -67,14 +65,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 228.9 | 131.3 | 5.22 |
-| 4 | 128 | 544.2 | 87.8 | 8.43 |
-| 8 | 128 | 786.3 | 212.0 | 12.20 |
-| 16 | 128 | 1069.8 | 281.7 | 17.54 |
-| 32 | 128 | 1428.1 | 385.2 | 24.90 |
-| 64 | 128 | 1812.7 | 826.7 | 49.51 |
-| 128 | 256 | 2379.8 | 1592.0 | 73.78 |
-| 256 | 512 | 3113.4 | 3045.9 | 122.08 |
+| 1 | 128 | 232.8 | 131.8 | 5.17 |
+| 4 | 128 | 557.7 | 93.2 | 8.76 |
+| 8 | 128 | 787.1 | 205.4 | 11.55 |
+| 16 | 128 | 1084.7 | 281.8 | 17.55 |
+| 32 | 128 | 1442.4 | 369.7 | 24.77 |
+| 64 | 128 | 1872.9 | 835.6 | 38.33 |
+| 128 | 256 | 2390.4 | 1651.4 | 78.07 |
+| 256 | 512 | 3237.5 | 3052.7 | 119.85 |
 
 ## Accepted progress
 
@@ -99,4 +97,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 17 | Medium grouped experts | 211.7 | [`ba418b9`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/ba418b932c779f5224cc2657e52a769112cf0917) |
 | 18 | Cold-start guards | 209.3 | [`62b3bf7`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/62b3bf717ce8447cd20c62b06a2bfbe781b6836d) |
 | 19 | Counter-safe collectives | 211.4 | [`b4be2dd`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/b4be2ddcfaf547f6f042d91aac6a104dfabae3a2) |
-| 20 | Compact two-way experts | 228.9 | This revision |
+| 20 | Compact two-way experts | 228.9 | [`cf53cb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/cf53cb67cf3f69c26acbbe9afd07ec428d766c60) |
+| 21 | Target vocabulary-parallel sampling | 232.8 | This revision |

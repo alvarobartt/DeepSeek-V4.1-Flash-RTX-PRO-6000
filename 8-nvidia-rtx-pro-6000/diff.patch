@@ -1854,3 +1854,149 @@
 +    n=query.numel()
 +    _initialize.warmup(capacity,non_draft,cu,query,0,0,int(bonus),n,256,
 +                       grid=(triton.cdiv(n,256),),num_warps=4)
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1595,6 +1595,12 @@
+         input_batch: InputBatch,
+         grammar_output: GrammarOutput | None,
+     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        from vllm.v1.worker.gpu.sm120_target_greedy import try_sample
++
++        greedy_output = try_sample(self, hidden_states, input_batch, grammar_output)
++        if greedy_output is not None:
++            return greedy_output, greedy_output.num_sampled, greedy_output.num_rejected
++
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sm120_target_greedy.py
+@@ -0,0 +1,128 @@
++import os
++
++import numpy as np
++import torch
++
++from vllm.distributed import tensor_model_parallel_all_gather
++from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.sample.output import SamplerOutput
++
++_ENABLED = os.environ.get('VLLM_SM120_TARGET_GREEDY') == '1'
++_FAST_CALLS = 0
++_FALLBACK_CALLS = 0
++
++
++@triton.jit
++def _pack_argmax(Logits, Pairs, stride, count, start, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    col = tl.arange(0, BLOCK)
++    values = tl.load(Logits + row * stride + col, col < count, other=-float('inf')).to(tl.float32)
++    best = tl.max(values, 0)
++    index = tl.min(tl.where((col < count) & (values == best), col, 2147483647), 0)
++    tl.store(Pairs + row * 2, best)
++    tl.store(Pairs + row * 2 + 1, (index + start).to(tl.float32))
++
++
++@triton.jit
++def _verify_pairs(Pairs, Cu, Idx, Input, Positions, LogitIndices, LocalPos,
++                  Prefill, SeqLens, Sampled, Counts, Rejected,
++                  TP: tl.constexpr, STEPS: tl.constexpr, WIDTH: tl.constexpr):
++    req = tl.program_id(0)
++    begin = tl.load(Cu + req)
++    end = tl.load(Cu + req + 1)
++    state = tl.load(Idx + req)
++    prefill = tl.load(Prefill + state)
++    step = tl.arange(0, WIDTH)
++    rank = tl.arange(0, TP)
++    row = begin + step
++    values = tl.load(Pairs + row[:, None] * (TP * 2) + rank[None, :] * 2,
++                     row[:, None] < end, other=-float('inf'))
++    ids = tl.load(Pairs + row[:, None] * (TP * 2) + rank[None, :] * 2 + 1,
++                  row[:, None] < end, other=2147483647).to(tl.int64)
++    best = tl.max(values, 1)
++    target = tl.min(tl.where(values == best[:, None], ids, 2147483647), 1)
++    next_row = row + 1
++    next_valid = next_row < end
++    next_index = tl.load(LogitIndices + next_row, next_valid, other=0)
++    draft = tl.load(Input + next_index, next_valid, other=-1).to(tl.int64)
++    pos = tl.load(Positions + next_index, next_valid, other=0)
++    local = tl.load(LocalPos + next_row, next_valid, other=0)
++    placeholder = (local > 0) & (pos - local < prefill)
++    mismatch = next_valid & ((target != draft) | (draft < 0) | placeholder)
++    length = tl.min(tl.where(mismatch, step, end - begin - 1), 0)
++    tl.store(Sampled + req * (STEPS + 1) + step,
++             tl.where(step <= length, target, -1), step < STEPS + 1)
++    chunked = tl.load(SeqLens + req) < prefill
++    count = tl.where(chunked, 0, length + 1)
++    tl.store(Counts + req, count)
++    tl.store(Rejected + req, tl.where(chunked, 0, end - begin - count))
++
++
++def pack_argmax(logits, count, start):
++    pairs = torch.empty((logits.shape[0], 2), dtype=torch.float32, device=logits.device)
++    _pack_argmax[(logits.shape[0],)](logits, pairs, logits.stride(0), count, start,
++                                  BLOCK=triton.next_power_of_2(count), num_warps=8)
++    return pairs
++
++
++def verify_pairs(pairs, batch, prefill, steps, tp):
++    sampled = torch.empty((batch.num_reqs, steps + 1), dtype=torch.int64, device=pairs.device)
++    counts = torch.empty(batch.num_reqs, dtype=torch.int32, device=pairs.device)
++    rejected = torch.empty_like(counts)
++    _verify_pairs[(batch.num_reqs,)](
++        pairs, batch.cu_num_logits, batch.idx_mapping, batch.input_ids,
++        batch.positions, batch.logits_indices, batch.expanded_local_pos,
++        prefill, batch.seq_lens, sampled, counts, rejected,
++        TP=tp, STEPS=steps, WIDTH=triton.next_power_of_2(steps + 1), num_warps=4)
++    return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None,
++                         num_nans=None, num_sampled=counts, num_rejected=rejected,
++                         sampling_mask_tensors=None)
++
++
++def try_sample(runner, hidden, batch, grammar):
++    global _FAST_CALLS, _FALLBACK_CALLS
++    if not _ENABLED:
++        return None
++    result = _try_sample(runner, hidden, batch, grammar)
++    if result is None:
++        _FALLBACK_CALLS += 1
++    else:
++        _FAST_CALLS += 1
++    return result
++
++
++def _try_sample(runner, hidden, batch, grammar):
++    if batch.num_reqs == 0 or grammar is not None or batch.has_structured_output_reqs:
++        return None
++    sampler = runner.sampler
++    model = getattr(runner.model, "language_model", runner.model)
++    if (sampler is None or runner.batch_sharder is not None or runner.lora_config is not None
++            or type(model).__name__ != 'DeepseekV41LLMForCausalLM'
++            or sampler.compute_nans or sampler.return_sampling_mask
++            or sampler.trace_replay_state is not None
++            or type(sampler).__name__ != 'Sampler'):
++        return None
++    mapping = batch.idx_mapping_np
++    if (np.any(sampler.sampling_states.temperature.np[mapping] != 0)
++            or np.any(sampler.needs_logits_processing[mapping])
++            or sampler.get_logprobs_dims(mapping) is not None):
++        return None
++    rejection = runner.rejection_sampler
++    if rejection is not None and (rejection.synthetic_conditional_rates is not None
++                                  or rejection.use_block_verification
++                                  or rejection.watermark_key is not None):
++        return None
++    steps = runner.num_speculative_steps
++    if steps > 8 or torch.cuda.get_device_capability(hidden.device) != (12, 0):
++        return None
++    head = model.lm_head
++    if head.tp_size not in (4, 8) or model.logits_processor.org_vocab_size >= 2**24:
++        return None
++    indices = head.shard_indices
++    if getattr(indices, 'num_added_vocab', 0) != 0 or model.logits_processor.org_vocab_size != model.logits_processor.vocab_size:
++        return None
++    logits = model.compute_logits_local(hidden[batch.logits_indices])
++    count = logits.shape[1] - indices.num_org_vocab_padding
++    pairs = pack_argmax(logits, count, indices.org_vocab_start_index)
++    gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
++    return verify_pairs(gathered, batch, sampler.req_states.prefill_len.gpu, steps, head.tp_size)
