@@ -1635,3 +1635,379 @@
 +    if (warps == 8) return dispatch_mma<8>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
 +    return int(cudaErrorInvalidValue);
 +}
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -61,6 +61,26 @@
+         sp_size_=sp_size,
+         vllm_parallel_config=parallel_config,
+     )
++
++    import os
++
++    expert_tp = os.environ.get("VLLM_SM120_EXPERT_TP", "1")
++    if expert_tp != "1":
++        if not (
++            expert_tp in ("2", "4")
++            and tp_size_ in (4, 8)
++            and dp_size_ == 1
++            and pcp_size_ == 1
++            and moe_parallel_config.use_ep
++            and not moe_parallel_config.enable_eplb
++            and moe_parallel_config.all2all_backend == "allgather_reducescatter"
++        ):
++            raise ValueError("Unsupported sm120 expert tensor-parallel layout")
++        transport_rank = moe_parallel_config.ep_rank
++        moe_parallel_config.tp_size = int(expert_tp)
++        moe_parallel_config.tp_rank = transport_rank % int(expert_tp)
++        moe_parallel_config.ep_size //= int(expert_tp)
++        moe_parallel_config.ep_rank = transport_rank // int(expert_tp)
+ 
+     assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
+ 
+@@ -376,6 +396,10 @@
+         skip_final_all_reduce=skip_final_all_reduce,
+     )
+ 
++    import os
++    if os.environ.get("VLLM_SM120_EXPERT_TP") == "4":
++        moe_config.tp_shard_with_padding = True
++
+     logger.debug("FusedMoEConfig = %s", moe_config)
+ 
+     # Create RoutedExperts instance BEFORE create_weights()
+--- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
+@@ -619,25 +619,42 @@
+ 
+         if (
+             self._sm120_small_moe
++            and expert_map is not None
++            and hidden_states.dtype == torch.float8_e4m3fn
++            and self.w1_scale.dtype == torch.int32
++            and self.w2_scale.dtype == torch.int32
++            and w2.shape == (w1.size(0), 5120, 576)
++            and activation == MoEActivation.SILU
++            and not apply_router_weight_on_input
++            and (
++                (expert_map.numel() == 384 and w1.shape == (192, 2304, 2560)
++                 and topk_ids.size(1) == 6 and 96 < hidden_states.size(0) <= 1024)
++                or (expert_map.numel() == 128 and w1.shape == (64, 2304, 2560)
++                    and topk_ids.size(1) == 3 and 96 < hidden_states.size(0) <= 512)
++            )
++        ):
++            from vllm.model_executor.layers.fused_moe.experts.sm120_medium_moe import small_moe
++            small_moe(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                      expert_map, a1q_scale, workspace2)
++            return
++
++        if (
++            self._sm120_small_moe
++            and expert_map is not None
++            and expert_map.numel() == 384
+             and 0 < hidden_states.size(0) <= 96
+             and hidden_states.dtype == torch.float8_e4m3fn
+-            and w1.shape[0] in (48, 96)
+-            and w1.shape[1:] == (4608, 2560)
+-            and w2.shape == (w1.shape[0], 5120, 1152)
++            and w1.shape == (192, 2304, 2560)
++            and w2.shape == (192, 5120, 576)
+             and self.w1_scale.dtype == torch.int32
+             and self.w2_scale.dtype == torch.int32
+             and topk_ids.size(1) == 6
+             and activation == MoEActivation.SILU
+             and not apply_router_weight_on_input
+         ):
+-            from vllm.model_executor.layers.fused_moe.experts.sm120_small_moe import (
+-                small_moe,
+-            )
+-
+-            small_moe(
+-                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
+-                expert_map, a1q_scale, workspace2,
+-            )
++            from vllm.model_executor.layers.fused_moe.experts.sm120_grouped_moe import small_moe
++            small_moe(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                      expert_map, a1q_scale, workspace2)
+             return
+ 
+         a1q = hidden_states
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_medium_moe.py
+@@ -0,0 +1,277 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2025 by FlashInfer team.
++
++import torch
++import triton
++import triton.language as tl
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
++    make_mxfp8_q0_route_workspace,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import (
++    prefix_cursor_kernel,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import (
++    SF_M_ALIGN,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import (
++    cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
++)
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++
++@triton.jit(do_not_specialize=["total_pairs"])
++def _count_routes_dynamic(
++    topk_ids, counts, total_pairs, block_n: tl.constexpr
++):
++    pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
++    valid = pair_idx < total_pairs
++    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
++    tl.atomic_add(counts + expert, 1, mask=expert >= 0, sem="relaxed")
++
++@triton.jit(do_not_specialize=["total_pairs"])
++def _route_assign_dynamic(
++    topk_ids,
++    topk_weights,
++    offsets,
++    expert_cursor,
++    token_map,
++    token_weights,
++    dst_rows,
++    scale_dst_rows,
++    total_pairs,
++    top_k: tl.constexpr,
++    scale_align: tl.constexpr,
++    block_n: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = tl.arange(0, block_n)
++    pair_idx = pid * block_n + offs
++    valid = pair_idx < total_pairs
++    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
++    # Unrouted (negative id) pairs take no row; see the module docstring.
++    routed = expert >= 0
++    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=routed, sem="relaxed")
++    token_idx = pair_idx // top_k
++    expert_begin = tl.load(offsets + expert, mask=routed, other=0)
++    scale_begin = (expert_begin + expert * (scale_align - 1)) & -scale_align
++    tl.store(token_map + routed_row, token_idx, mask=routed)
++    tl.store(
++        token_weights + routed_row,
++        tl.load(topk_weights + pair_idx, mask=routed, other=0.0),
++        mask=routed,
++    )
++    tl.store(dst_rows + pair_idx, tl.where(routed, routed_row, -1), mask=valid)
++    tl.store(
++        scale_dst_rows + pair_idx,
++        tl.where(routed, scale_begin + routed_row - expert_begin, -1),
++        mask=valid,
++    )
++
++@triton.jit(do_not_specialize=["N"])
++def _map_ids_dynamic(IDS, MAP, LOCAL, N, BLOCK: tl.constexpr):
++    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    expert = tl.load(IDS + r, r < N, -1)
++    local = tl.load(MAP + expert, (r < N) & (expert >= 0), -1)
++    tl.store(LOCAL + r, local, r < N)
++
++
++@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
++def _copy_quantized_dynamic(
++    X,
++    XS,
++    DST,
++    SFDST,
++    Q,
++    SF,
++    K: tl.constexpr,
++    TOPK: tl.constexpr,
++    XS0,
++    XS1,
++    SF0,
++    SF1,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    block = tl.program_id(1)
++    token = route // TOPK
++    dest = tl.load(DST + route)
++    sfrow = tl.load(SFDST + route)
++    cols = block * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + token * K + cols, cols < K, 0)
++    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
++    for part in tl.static_range(BLOCK // 512):
++        word = block * (BLOCK // 512) + part
++        if PACKED_XS:
++            scale = tl.load(
++                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
++            )
++        else:
++            scale = tl.full((), 0, tl.int32)
++            for group in tl.static_range(4):
++                sf = tl.load(
++                    XS + token * XS0 + (word * 4 + group) * XS1,
++                    word * 4 + group < triton.cdiv(K, 128),
++                    0,
++                )
++                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++                scale = scale | exponent << group * 8
++        tl.store(
++            SF + word * SF0 + sfrow * SF1,
++            scale,
++            (word < triton.cdiv(K, 512)) & (dest >= 0),
++        )
++
++
++@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
++def _copy_scales_dynamic(
++    XS,
++    DST,
++    SFDST,
++    SF,
++    K: tl.constexpr,
++    XS0,
++    XS1,
++    SF0,
++    SF1,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    source = tl.load(DST + route)
++    dest = tl.load(SFDST + route)
++    word = tl.arange(0, BLOCK)
++    valid = (source >= 0) & (word < triton.cdiv(K, 512))
++    if PACKED_XS:
++        scale = tl.load(XS + source * XS0 + word * XS1, valid, 0)
++    else:
++        scale = tl.full((BLOCK,), 0, tl.int32)
++        for group in tl.static_range(4):
++            sf = tl.load(
++                XS + source * XS0 + (word * 4 + group) * XS1,
++                (source >= 0) & (word * 4 + group < triton.cdiv(K, 128)),
++                0,
++            )
++            exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++            scale = scale | exponent << group * 8
++    tl.store(SF + word * SF0 + dest * SF1, scale, valid)
++
++
++@triton.jit
++def _reduce(Y, DST, RW, OUT, K: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    value = tl.full((BLOCK,), 0, tl.float32)
++    for slot in range(TOPK):
++        row = tl.load(DST + token * TOPK + slot)
++        weight = tl.load(RW + token * TOPK + slot)
++        x = tl.load(Y + row * K + cols, (row >= 0) & (cols < K), 0).to(tl.float32)
++        value += x * weight
++    tl.store(OUT + token * K + cols, value, cols < K)
++
++
++def prepare(experts, w1, w2):
++    source = (experts.w1_scale.data_ptr(), experts.w2_scale.data_ptr())
++    if getattr(experts, "_sm120_grouped_source", None) != source:
++        experts._sm120_grouped_scales = (
++            experts.w1_scale.permute(0, 2, 1).contiguous(),
++            experts.w2_scale.permute(0, 2, 1).contiguous(),
++        )
++        experts._sm120_grouped_source = source
++
++
++_SM120_MEDIUM_SHAPES = set()
++
++def small_moe(
++    experts,
++    output,
++    x,
++    w1,
++    w2,
++    weights,
++    ids,
++    expert_map,
++    x_scale,
++    workspace,
++    bn=4,
++    bk=256,
++):
++    prepare(experts, w1, w2)
++    b, ds = experts._sm120_grouped_scales
++    a, down = (w1, w2)
++    m, k = x.shape
++    _SM120_MEDIUM_SHAPES.add((m,w1.shape[0],w1.shape[1]//2,ids.shape[1]))
++    topk = ids.shape[1]
++    pairs = ids.numel()
++    mapped = torch.empty_like(ids)
++    _map_ids_dynamic[triton.cdiv(pairs,256),](
++        ids, expert_map, mapped, pairs, 256, num_warps=4
++    )
++    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
++    counts = torch.zeros(w1.shape[0], device=x.device, dtype=torch.int32)
++    cursor = torch.empty_like(counts)
++    route.scale_out.zero_()
++    _count_routes_dynamic[triton.cdiv(pairs,256),](
++        mapped, counts, pairs, 256, num_warps=4,
++    )
++    prefix_cursor_kernel[1,](
++        counts, route.offsets, cursor, w1.shape[0],
++        triton.next_power_of_2(w1.shape[0]), num_warps=4,
++    )
++    _route_assign_dynamic[triton.cdiv(pairs,256),](
++        mapped, weights, route.offsets, cursor, route.token_map,
++        route.token_weights, route.dst_rows, route.scale_dst_rows,
++        pairs, topk, SF_M_ALIGN, 256, num_warps=4,
++    )
++    _copy_quantized_dynamic[pairs, triton.cdiv(k, 1024)](
++        x.view(torch.uint8),
++        x_scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.q_out.view(torch.uint8),
++        route.scale_out,
++        k,
++        topk,
++        *x_scale.stride(),
++        *route.scale_out.stride(),
++        x_scale.dtype == torch.int32,
++        1024,
++        num_warps=4,
++    )
++    tile = (max(32, min(128, triton.next_power_of_2(triton.cdiv(pairs, expert_map.numel())))), 128, 128)
++    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
++        route.q_out, route.scale_out, a, b, route.offsets, tile=tile, tune=False
++    )
++    intermediate = w1.shape[1] // 2
++    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    sf2 = torch.zeros(
++        (triton.cdiv(intermediate, 512), route.scale_out.shape[1]),
++        device=x.device,
++        dtype=torch.int32,
++    )
++    _copy_scales_dynamic[pairs,](
++        scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        sf2,
++        intermediate,
++        *scale.stride(),
++        *sf2.stride(),
++        scale.dtype == torch.int32,
++        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
++        num_warps=4,
++    )
++    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tile=tile, tune=False)
++    _reduce[m, triton.cdiv(k, 256)](
++        y,
++        route.dst_rows,
++        weights,
++        output,
++        k,
++        topk,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return output
