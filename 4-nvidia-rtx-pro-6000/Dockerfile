@@ -26,3 +26,5 @@ RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
     -o /usr/local/lib/libvllm-sm120-g2-wo-a-mma.so
 
 ENV NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
+
+ENV VLLM_SM120_TARGET_GREEDY=1

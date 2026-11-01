@@ -4,12 +4,13 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 5. Aligned TP2 and EP2 experts
+## 6. Five-draft TP4 experts
 
-- Use two-way expert tensor parallelism and two expert groups so 1,152-channel shards retain the native aligned FP8 and MXFP4 kernels.
-- Adapt the grouped kernels to 192 target experts and 64 draft experts per bank to reuse their small- and medium-batch paths.
-- Set the batching budget to 6,144 tokens to improve concurrent throughput while retaining the full context.
--    --gpu-memory-utilization 0.97
+- Use compact four-way expert shards to split each routed expert across all four GPUs and reduce per-GPU work for a single request.
+- Use five draft tokens, a 4,096-token batching budget, and 768-row graph coverage to improve decode reuse while preserving the original small graph sizes.
+- Use vocabulary-parallel greedy sampling to exchange each rank's best value and token ID while retaining native sampling for other settings.
+-    --speculative-config '{"method":"dspark","num_speculative_tokens":3,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true,"use_local_argmax_reduction":true}' \
+-    --max-num-batched-tokens 6144
 
 Requirements, on a fresh vLLM image:
 
@@ -47,7 +48,9 @@ nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
     "$vllm_package_dir/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu" \
     -o /usr/local/lib/libvllm-sm120-g2-wo-a-mma.so
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
-export VLLM_SM120_EXPERT_TP=2
+export VLLM_SM120_EXPERT_TP=4
+export VLLM_SM120_COMPACT_EXPERTS=1
+export VLLM_SM120_TARGET_GREEDY=1
 ```
 
 Then, run server as:
@@ -63,21 +66,22 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --mm-encoder-tp-mode data \
     --block-size 64 \
     --enable-expert-parallel \
-    --speculative-config '{"method":"dspark","num_speculative_tokens":3,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true,"use_local_argmax_reduction":true}' \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true,"use_local_argmax_reduction":true}' \
     --gpu-memory-utilization 0.97 \
-    --max-num-batched-tokens 6144
+    --max-num-batched-tokens 4096 \
+    --compilation-config '{"max_cudagraph_capture_size":768,"cudagraph_capture_sizes":[1,2,4,6,8,12,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512,528,544,560,576,592,608,624,640,656,672,688,704,720,736,752,768]}'
 ```
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 192.2 | 131.5 | 6.15 |
-| 4 | 128 | 441.8 | 102.2 | 10.49 |
-| 8 | 128 | 628.9 | 228.9 | 15.40 |
-| 16 | 128 | 861.3 | 283.1 | 21.06 |
-| 32 | 128 | 1231.1 | 462.7 | 29.89 |
-| 64 | 128 | 1504.3 | 889.7 | 50.18 |
-| 128 | 256 | 2059.7 | 1618.5 | 80.12 |
-| 256 | 512 | 2737.3 | 2908.4 | 151.46 |
+| 1 | 128 | 213.9 | 121.6 | 6.09 |
+| 4 | 128 | 497.5 | 101.0 | 10.01 |
+| 8 | 128 | 683.8 | 158.3 | 14.19 |
+| 16 | 128 | 930.5 | 288.6 | 21.62 |
+| 32 | 128 | 1325.5 | 411.0 | 26.78 |
+| 64 | 128 | 1654.9 | 868.4 | 46.74 |
+| 128 | 256 | 2180.9 | 1702.7 | 79.64 |
+| 256 | 512 | 2782.1 | 3371.6 | 122.90 |
 
 ## Accepted progress
 
@@ -88,4 +92,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 2 | Ninety-six local experts | 161.5 | [`26ae9ab`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/26ae9abd68d901a24ec36c582ae2c354a34eb81c) |
 | 3 | Four-rank host collectives | 173.8 | [`630b1eb`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/630b1eb24926b2c70072dbe1d0c3a8af4adb4226) |
 | 4 | Grouped BF16 projections | 178.5 | [`253839f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/253839f710753836599f93bdcca65e822f0ac618) |
-| 5 | Aligned TP2 and EP2 experts | 192.2 | This revision |
+| 5 | Aligned TP2 and EP2 experts | 192.2 | [`d0fbce8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/d0fbce80bfdab5115723369ed99b7ee5881d2c99) |
+| 6 | Five-draft TP4 experts | 213.9 | This revision |

@@ -470,10 +470,39 @@
  
      @staticmethod
      def activation_format() -> mk.FusedMoEActivationFormat:
-@@ -613,6 +617,29 @@
+@@ -525,6 +529,11 @@
+         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+         activation: MoEActivation,
+     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
++        import os
++        if (os.environ.get("VLLM_SM120_COMPACT_EXPERTS") == "1"
++                and K == 5120 and N == 1152
++                and self.moe_config.intermediate_size_per_partition == 576):
++            return (M, K), (M, K), (M, K)
+         block_m = get_mk_alignment_for_contiguous_layout()[0]
+         M_sum, align_used = compute_aligned_M_and_alignment(
+             M, topk, local_num_experts, block_m, expert_tokens_meta
+@@ -608,10 +617,45 @@
+         expert_tokens_meta: mk.ExpertTokensMetadata | None,
+         apply_router_weight_on_input: bool,
+     ):
++        import os
++        if (os.environ.get("VLLM_SM120_COMPACT_EXPERTS") == "1"
++                and self.moe_config.intermediate_size_per_partition == 576):
++            assert self._sm120_small_moe
++            assert hidden_states.dtype == torch.float8_e4m3fn and hidden_states.shape[1] == 5120
++            assert w1.shape[1:] == (1152, 2560) and w2.shape[1:] == (5120, 288)
++            assert activation == MoEActivation.SILU and not apply_router_weight_on_input
++            assert self.w1_scale.dtype == self.w2_scale.dtype == torch.int32
++            from vllm.model_executor.layers.fused_moe.experts.sm120_compact_moe import small_moe
++            small_moe(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
++                      expert_map, a1q_scale, workspace2)
++            return
+         assert a1q_scale is not None
+         assert a2_scale is None
          assert self.w1_scale is not None
          assert self.w2_scale is not None
- 
++
 +        if (
 +            self._sm120_small_moe
 +            and 0 < hidden_states.size(0) <= 96
@@ -496,10 +525,815 @@
 +                expert_map, a1q_scale, workspace2,
 +            )
 +            return
-+
+ 
          a1q = hidden_states
          _, N, _ = w1.size()
-         # K comes from activations (full hidden dim), not from w1 which is
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_grouped_down.py
+@@ -0,0 +1,134 @@
++import torch
++import hashlib
++import os
++import copy
++from triton.compiler.compiler import make_backend
++import json
++from pathlib import Path
++from triton.backends.compiler import GPUTarget
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def tile_prefix(OFF,PREFIX,E:tl.constexpr,BM:tl.constexpr,BLOCK:tl.constexpr):
++    expert=tl.arange(0,BLOCK)
++    first=tl.load(OFF+expert,expert<E,0)
++    last=tl.load(OFF+expert+1,expert<E,0)
++    count=tl.cdiv(last-first,BM)
++    cumulative=tl.cumsum(count)
++    tl.store(PREFIX,0)
++    tl.store(PREFIX+expert+1,cumulative,expert<E)
++
++
++@triton.jit(do_not_specialize=['PAIRS','AS1'])
++def routed_gemm(Q,W,AS,BS,PREFIX,IDS,OFF,Y,N:tl.constexpr,K:tl.constexpr,PAIRS,QS0:tl.constexpr,
++                AS0:tl.constexpr,AS1,BS0:tl.constexpr,BS1:tl.constexpr,BS2:tl.constexpr,
++                PACKED:tl.constexpr,PACKED_WS:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,SPLITS:tl.constexpr,BM:tl.constexpr,E:tl.constexpr):
++    tile=tl.program_id(1)
++    if tile<tl.load(PREFIX+E):
++        experts=tl.arange(0,triton.next_power_of_2(E))
++        stops=tl.load(PREFIX+experts+1,experts<E,2147483647)
++        expert=tl.sum((tile>=stops).to(tl.int32))
++        first=tl.load(OFF+expert)
++        end=tl.load(OFF+expert+1)
++        dest=first+(tile-tl.load(PREFIX+expert))*BM
++        if dest<end:
++            row=dest+tl.arange(0,BM)
++            col=tl.program_id(0)*BN+tl.arange(0,BN)
++            ki=tl.arange(0,BK)
++            kp=tl.arange(0,BK//2)
++            groups=tl.arange(0,BK//32)
++            acc=tl.full((BM,BN),0,tl.float32)
++            for step in range(tl.cdiv(K,BK*SPLITS)):
++                begin=tl.program_id(2)*tl.cdiv(K,BK*SPLITS)+step
++                k=begin*BK+ki
++                a=tl.load(Q+row[:,None]*QS0+k[None,:],(row[:,None]<end)&(k[None,:]<K),0.0)
++                packed=begin*(BK//2)+kp
++                b=tl.load(W+expert*N*(K//2)+col[:,None]*(K//2)+packed[None,:],(col[:,None]<N)&(packed[None,:]<K//2),0)
++                group=begin*(BK//32)+groups
++                ag=group//4
++                if PACKED:
++                    word=tl.load(AS+row[:,None]*AS0+(ag[None,:]//4)*AS1,(row[:,None]<end)&(group[None,:]<K//32),0)
++                    a_scale=((word>>((ag[None,:]%4)*8))&255).to(tl.uint8)
++                else:
++                    scale=tl.load(AS+row[:,None]*AS0+ag[None,:]*AS1,(row[:,None]<end)&(group[None,:]<K//32),0.)
++                    a_scale=((scale.to(tl.int32,bitcast=True)>>23)&255).to(tl.uint8)
++                if PACKED_WS:
++                    word=tl.load(BS+expert*BS0+col[:,None]*BS1+(group[None,:]//4)*BS2,(col[:,None]<N)&(group[None,:]<K//32),0)
++                    b_scale=((word>>((group[None,:]%4)*8))&255).to(tl.uint8)
++                else:
++                    b_scale=tl.load(BS+expert*BS0+col[:,None]*BS1+group[None,:]*BS2,(col[:,None]<N)&(group[None,:]<K//32),0).to(tl.uint8)
++                low=(b&15)<<2
++                high=(b>>4)<<2
++                expanded=tl.interleave(low,high).to(tl.float8e4nv,bitcast=True)
++                acc=tl.dot_scaled(a,a_scale,'e4m3',tl.trans(expanded),b_scale,'e4m3',acc=acc)
++            tl.store(Y+tl.program_id(2)*PAIRS*N+row[:,None]*N+col[None,:],acc,(row[:,None]<end)&(col[None,:]<N))
++
++
++@triton.jit(do_not_specialize=['PAIRS'])
++def weighted_reduce(P,DST,RW,Y,N:tl.constexpr,PAIRS,TOPK:tl.constexpr,SPLITS:tl.constexpr,BLOCK:tl.constexpr):
++    token=tl.program_id(0)
++    cols=tl.program_id(1)*BLOCK+tl.arange(0,BLOCK)
++    total=tl.full((BLOCK,),0,tl.float32)
++    for slot in range(TOPK):
++        row=tl.load(DST+token*TOPK+slot)
++        weight=tl.load(RW+token*TOPK+slot)
++        value=tl.full((BLOCK,),0,tl.float32)
++        for split in range(SPLITS):
++            value+=tl.load(P+split*PAIRS*N+row*N+cols,(row>=0)&(cols<N),0)
++        value=value.to(tl.bfloat16).to(tl.float32)
++        total+=value*weight
++    tl.store(Y+token*N+cols,total,cols<N)
++
++
++_COMPILED={}
++_CALLS=0
++_SHAPES=set()
++_PREFIX={}
++
++
++def down(q,scales,weight,weight_scales,route,ids,weights,out,partial,tile_n=32,tile_k=128,splits=1,tile_m=16):
++    global _CALLS
++    _CALLS+=1
++    _SHAPES.add((ids.shape[0],ids.shape[1],q.shape[1],weight.shape[0]))
++    pairs=q.shape[0]
++    k=weight.shape[2]*2
++    n=weight.shape[1]
++    experts=weight.shape[0]
++    device_key=(str(q.device),experts)
++    if device_key not in _PREFIX:_PREFIX[device_key]=torch.empty(experts+1,device=q.device,dtype=torch.int32)
++    prefix=_PREFIX[device_key]
++    tile_prefix[(1,)](route.offsets,prefix,experts,tile_m,triton.next_power_of_2(experts),num_warps=4)
++    args=(q,weight,scales,weight_scales,prefix,ids,route.offsets,partial,n,k,pairs,q.stride(0),*scales.stride(),*weight_scales.stride(),scales.dtype==torch.int32,weight_scales.dtype==torch.int32,tile_n,tile_k,splits,tile_m,experts)
++    grid=(triton.cdiv(n,tile_n),triton.cdiv(pairs,tile_m)+experts,splits)
++    key=(n,k,q.stride(0),scales.stride(0),*weight_scales.stride(),scales.dtype,weight_scales.dtype,partial.dtype,tile_n,tile_k,splits,tile_m,experts)
++    if key not in _COMPILED:
++        original=routed_gemm.warmup(*args,grid=grid,num_warps=4,num_stages=2)
++        ptx=original.asm['ptx']
++        source='.f32.e4m3.e4m3.f32.ue8m0'
++        replacement='.f32.e4m3.e2m1.f32.ue8m0'
++        assert source in ptx and replacement not in ptx
++        count=ptx.count(source)
++        patched_ptx=ptx.replace(source,replacement)
++        directory=Path(os.environ.get('TRITON_CACHE_DIR',str(Path.home()/'.triton/cache')))/'sm120_native_expert_mma';directory.mkdir(exist_ok=True,parents=True)
++        sha=hashlib.sha256(patched_ptx.encode()).hexdigest()
++        path=directory/(sha+'.ptx');path.write_text(patched_ptx)
++        backend=make_backend(GPUTarget('cuda',120,32))
++        options=backend.parse_options({'num_warps':4,'num_stages':2})
++        metadata=original.metadata._asdict()
++        binary=backend.make_cubin(patched_ptx,metadata,options,120)
++        patched=copy.copy(original)
++        patched.kernel=binary
++        patched.asm=dict(original.asm,ptx=patched_ptx,cubin=binary)
++        patched.hash=sha
++        patched.module=None
++        patched.function=None
++        patched._run=None
++        patched._init_handles()
++        _COMPILED[key]=patched
++        proof={'source_sha256':sha,'native_FP8_FP4_MMA_sites':count,'shared_bytes':original.metadata.shared,'registers':patched.n_regs,'spills':patched.n_spills,'scope':'Authored PTX operand format paired with zero-extended native FP4 nibbles; source kernel launcher and shared memory contract preserved'}
++        (directory/(sha+'.json')).write_text(json.dumps(proof,indent=2)+'\n')
++    _COMPILED[key][grid](*args)
++    weighted_reduce[(ids.shape[0],triton.cdiv(n,256))](partial,route.dst_rows,weights,out,n,pairs,ids.shape[1],splits,256,num_warps=4,enable_fp_fusion=False)
++    return out
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_linear_routing.py
+@@ -0,0 +1,99 @@
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit(do_not_specialize=['PAIRS'])
++def histogram(IDS,H,PAIRS,BINS:tl.constexpr,BLOCK:tl.constexpr):
++    positions=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)
++    expert=tl.load(IDS+positions,positions<PAIRS,-1)
++    bins=tl.where(expert>=0,expert+1,0)
++    counts=tl.histogram(bins,BINS)
++    tl.store(H+tl.program_id(0)*BINS+tl.arange(0,BINS),counts)
++
++
++@triton.jit(do_not_specialize=['TILES'])
++def tile_prefix(H,COUNTS,TILES,BINS:tl.constexpr,BLOCK_T:tl.constexpr):
++    expert=tl.program_id(0)
++    tiles=tl.arange(0,BLOCK_T)
++    counts=tl.load(H+tiles*BINS+expert+1,tiles<TILES,0)
++    prefix=tl.cumsum(counts)
++    tl.store(H+tiles*BINS+expert+1,prefix-counts,tiles<TILES)
++    tl.store(COUNTS+expert,tl.sum(counts))
++
++
++@triton.jit
++def offsets(COUNTS,OFFSETS,EXPERTS:tl.constexpr,BLOCK_E:tl.constexpr):
++    expert=tl.arange(0,BLOCK_E)
++    counts=tl.load(COUNTS+expert,expert<EXPERTS,0)
++    inclusive=tl.cumsum(counts)
++    tl.store(OFFSETS+expert,inclusive-counts,expert<EXPERTS)
++    tl.store(OFFSETS+EXPERTS,tl.sum(counts))
++
++
++@triton.jit
++def maximum(a,b):
++    return tl.maximum(a,b)
++
++
++@triton.jit(do_not_specialize=['PAIRS'])
++def scatter(IDS,WEIGHTS,H,OFFSETS,TOKEN_MAP,TOKEN_WEIGHTS,DST,SFDST,
++            PAIRS,TOPK:tl.constexpr,BINS:tl.constexpr,ALIGN:tl.constexpr,BLOCK:tl.constexpr):
++    tile=tl.program_id(0)
++    local=tl.arange(0,BLOCK)
++    pair=tile*BLOCK+local
++    expert=tl.load(IDS+pair,pair<PAIRS,-1)
++    bucket=tl.where(expert>=0,expert+1,0)
++    keys=tl.sort(bucket*BLOCK+local,descending=False)
++    sorted_expert=keys//BLOCK-1
++    original=keys%BLOCK
++    previous=tl.gather(sorted_expert,tl.maximum(local-1,0),0)
++    begin=tl.where((local==0)|(sorted_expert!=previous),local,0)
++    begin=tl.associative_scan(begin,0,maximum)
++    rank=local-begin
++    valid=sorted_expert>=0
++    expert_begin=tl.load(OFFSETS+sorted_expert,valid,0)
++    earlier=tl.load(H+tile*BINS+sorted_expert+1,valid,0)
++    destination=expert_begin+earlier+rank
++    scale_begin=(expert_begin+sorted_expert*(ALIGN-1))&-ALIGN
++    original_pair=tile*BLOCK+original
++    weight=tl.load(WEIGHTS+original_pair,valid,0.0)
++    tl.store(TOKEN_MAP+destination,original_pair//TOPK,valid)
++    tl.store(TOKEN_WEIGHTS+destination,weight,valid)
++    tl.store(DST+original_pair,tl.where(valid,destination,-1),original_pair<PAIRS)
++    tl.store(SFDST+original_pair,tl.where(valid,scale_begin+earlier+rank,-1),original_pair<PAIRS)
++
++
++_KERNELS={}
++_CALLS=0
++_SHAPES=set()
++
++
++def launch(kind,jit,args,grid,key):
++    full_key=(kind,args[0].device.index,*key)
++    grid=tuple(grid)+(1,)*(3-len(grid))
++    if full_key not in _KERNELS:
++        _KERNELS[full_key]=jit.warmup(*args,grid=grid,num_warps=4,num_stages=1)
++    _KERNELS[full_key][grid](*args)
++
++
++def assign(ids,weights,workspace,experts,align=128):
++    global _CALLS
++    _CALLS+=1
++    pairs=ids.numel()
++    _SHAPES.add((ids.shape[0],ids.shape[1],experts))
++    assert ids.dtype==torch.int32 and workspace.scale_out.is_contiguous()
++    block=512
++    tiles=triton.cdiv(pairs,block)
++    bins=triton.next_power_of_2(experts+1)
++    assert tiles*bins<=workspace.scale_out.numel()
++    hist=workspace.scale_out.view(-1)[:tiles*bins].view(tiles,bins)
++    launch('histogram',histogram,(ids,hist,pairs,bins,block),(tiles,),(bins,))
++    block_t=max(64,triton.next_power_of_2(tiles))
++    launch('tile_prefix',tile_prefix,(hist,workspace.counts,tiles,bins,block_t),(experts,),(bins,block_t))
++    launch('offsets',offsets,(workspace.counts,workspace.offsets,experts,triton.next_power_of_2(experts)),(1,),(experts,))
++    launch('scatter',scatter,(ids,weights,hist,workspace.offsets,workspace.token_map,workspace.token_weights,
++           workspace.dst_rows,workspace.scale_dst_rows,pairs,ids.shape[1],bins,align,block),
++           (tiles,),(ids.shape[1],bins,align,weights.dtype))
++    workspace.scale_out.zero_()
++    return workspace
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_moe.py
+@@ -0,0 +1,53 @@
++import torch
++import triton
++from vllm.model_executor.layers.fused_moe.experts import sm120_compact_linear_routing as linear_route
++from vllm.model_executor.layers.fused_moe.experts import sm120_compact_routing as small_dynamic_route
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import make_mxfp8_q0_route_workspace
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import route_assign_decode_kernel
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import SF_M_ALIGN
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4
++from vllm.model_executor.layers.fused_moe.experts.sm120_grouped_moe import _map_ids, _copy_quantized
++from vllm.model_executor.layers.fused_moe.experts.sm120_compact_tail_quant import quantize
++from vllm.model_executor.layers.fused_moe.experts.sm120_compact_tail_down import down as small_down
++from vllm.model_executor.layers.fused_moe.experts.sm120_compact_grouped_down import down as grouped_down
++
++
++def small_moe(experts, output, x, w1, w2, weights, ids, expert_map, x_scale, workspace=None, return_quantized=False):
++    assert x.dtype==torch.float8_e4m3fn and x.shape[1]==5120
++    assert w1.shape[1:]==(1152,2560)and w2.shape[1:]==(5120,288)
++    m,k=x.shape
++    topk=ids.shape[1]
++    pairs=ids.numel()
++    total=w1.shape[0]
++    if expert_map is None:
++        mapped=ids
++    else:
++        mapped=torch.empty_like(ids)
++        _map_ids[(1,)](ids,expert_map,mapped,pairs,triton.next_power_of_2(pairs),num_warps=4)
++    route=make_mxfp8_q0_route_workspace(x,mapped,total)
++    size=route.scale_out.numel()
++    block=max(256,triton.next_power_of_2(pairs))
++    if pairs>512:
++        linear_route.assign(mapped,weights,route,total,SF_M_ALIGN)
++    else:
++        block=max(256,triton.next_power_of_2(pairs))
++        small_dynamic_route.route_assign_decode_kernel[(max(total,pairs,triton.cdiv(size,block)),)](mapped,weights,route.offsets,route.token_map,route.token_weights,route.dst_rows,route.scale_dst_rows,route.scale_out,pairs,topk,total,SF_M_ALIGN,block,size,route.scale_out.shape[1],*route.scale_out.stride(),num_warps=4)
++    small_dynamic_route.copy_quantized[(pairs,triton.cdiv(k,1024))](x.view(torch.uint8),x_scale,route.dst_rows,route.scale_dst_rows,route.q_out.view(torch.uint8),route.scale_out,k,topk,*x_scale.stride(),*route.scale_out.stride(),x_scale.dtype==torch.int32,1024,num_warps=4)
++    source=experts.w1_scale.data_ptr()
++    if getattr(experts,'_sm120_compact_scale_source',None)!=source:
++        experts._sm120_compact_gateup_scales=experts.w1_scale.permute(0,2,1).contiguous()
++        experts._sm120_compact_scale_source=source
++    tile=(8 if m<=48 else 32,128,128)
++    projections=cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(route.q_out,route.scale_out,w1,experts._sm120_compact_gateup_scales,route.offsets,tile=tile,tune=False)
++    quantized=torch.empty((pairs,576),device=x.device,dtype=torch.float8_e4m3fn)
++    q,scales=quantize(projections,group_size=128,output_q=quantized,clamp_limit=experts.gemm1_clamp_limit)
++    partial=torch.empty((1,pairs,k),device=x.device,dtype=torch.bfloat16)
++    if m<=64:
++        small_down(q,scales,w2,experts.w2_scale,route,mapped,weights,output,partial,64,128,1,16)
++    elif m<1024:
++        grouped_down(q,scales,w2,experts.w2_scale,route,mapped,weights,output,partial,64,128,1,32)
++    else:
++        grouped_down(q,scales,w2,experts.w2_scale,route,mapped,weights,output,partial,128,128,1,64)
++    if return_quantized:
++        return output,q
++    return output
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_routing.py
+@@ -0,0 +1,156 @@
++# Copyright (c) 2025 by FlashInfer team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import torch
++import triton
++import triton.language as tl
++
++@triton.jit(do_not_specialize=['total_pairs', 'total_scale', 'padded_rows', 's_som', 's_sok'])
++def _route_jit(
++    topk_ids,
++    topk_weights,
++    offsets,
++    token_map,
++    token_weights,
++    dst_rows,
++    scale_dst_rows,
++    scale_out,
++    total_pairs,
++    top_k: tl.constexpr,
++    num_experts: tl.constexpr,
++    scale_align: tl.constexpr,
++    block_n: tl.constexpr,
++    total_scale,
++    padded_rows,
++    s_som,
++    s_sok,
++):
++    pid = tl.program_id(0)
++    offs = tl.arange(0, block_n)
++    # Unrouted (negative id) pairs take no row; see the module docstring.
++    experts = tl.load(topk_ids + offs, mask=offs < total_pairs, other=-1)
++    routed = experts >= 0
++    flat = pid * block_n + offs
++    tl.store(scale_out + flat, 0, mask=flat < total_scale)
++    expert_prefix = tl.sum(tl.where(routed & (experts < pid), 1, 0), 0)
++    tl.store(offsets + pid, expert_prefix, mask=pid < num_experts)
++    tl.store(offsets + num_experts, tl.sum(tl.where(routed, 1, 0), 0), mask=pid == 0)
++    is_pair = pid < total_pairs
++    pair_expert = tl.load(topk_ids + pid, mask=is_pair, other=-1)
++    pair_routed = pair_expert >= 0
++    expert_begin = tl.sum(tl.where(routed & (experts < pair_expert), 1, 0), 0)
++    rank = tl.sum(tl.where(routed & (experts == pair_expert) & (offs < pid), 1, 0), 0)
++    routed_row = expert_begin + rank
++    scale_begin = (expert_begin + pair_expert * (scale_align - 1)) & -scale_align
++    token_idx = pid // top_k
++    tl.store(token_map + routed_row, token_idx, mask=pair_routed)
++    tl.store(
++        token_weights + routed_row,
++        tl.load(topk_weights + pid, mask=pair_routed, other=0.0),
++        mask=pair_routed,
++    )
++    tl.store(dst_rows + pid, tl.where(pair_routed, routed_row, -1), mask=is_pair)
++    tl.store(
++        scale_dst_rows + pid,
++        tl.where(pair_routed, scale_begin + rank, -1),
++        mask=is_pair,
++    )
++
++
++@triton.jit(do_not_specialize=['XS0', 'XS1', 'SF0', 'SF1'])
++def _copy_jit(
++    X,
++    XS,
++    DST,
++    SFDST,
++    Q,
++    SF,
++    K: tl.constexpr,
++    TOPK: tl.constexpr,
++    XS0,
++    XS1,
++    SF0,
++    SF1,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    block = tl.program_id(1)
++    token = route // TOPK
++    dest = tl.load(DST + route)
++    sfrow = tl.load(SFDST + route)
++    cols = block * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + token * K + cols, cols < K, 0)
++    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
++    for part in tl.static_range(BLOCK // 512):
++        word = block * (BLOCK // 512) + part
++        if PACKED_XS:
++            scale = tl.load(
++                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
++            )
++        else:
++            scale = tl.full((), 0, tl.int32)
++            for group in tl.static_range(4):
++                sf = tl.load(
++                    XS + token * XS0 + (word * 4 + group) * XS1,
++                    word * 4 + group < triton.cdiv(K, 128),
++                    0,
++                )
++                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++                scale = scale | exponent << group * 8
++        tl.store(
++            SF + word * SF0 + sfrow * SF1,
++            scale,
++            (word < triton.cdiv(K, 512)) & (dest >= 0),
++        )
++
++
++_CACHES={'route':{},'copy':{}}
++_CALLS={'route':0,'copy':0}
++
++
++class Kernel:
++    def __init__(self,kind,jit,constant_indices,pointers):
++        self.kind=kind
++        self.jit=jit
++        self.constant_indices=constant_indices
++        self.pointers=pointers
++
++    def key(self,args,kwargs):
++        return (args[0].device.index,tuple(str(value.dtype)for value in args[:self.pointers]),
++                tuple(args[index]for index in self.constant_indices),tuple(sorted(kwargs.items())))
++
++    def __getitem__(self,grid):
++        def launch(*args,**kwargs):
++            _CALLS[self.kind]+=1
++            if self.kind=='route':assert args[7].is_contiguous()
++            actual_grid=tuple(grid)+(1,)*(3-len(grid))
++            cache=_CACHES[self.kind]
++            key=self.key(args,kwargs)
++            if key not in cache:
++                if self.kind=='route':
++                    for block in [256,512]:
++                        variant=list(args);variant[12]=block;variant=tuple(variant)
++                        variant_key=self.key(variant,kwargs)
++                        if variant_key not in cache:cache[variant_key]=self.jit.warmup(*variant,grid=actual_grid,**kwargs)
++                else:cache[key]=self.jit.warmup(*args,grid=actual_grid,**kwargs)
++            cache[key][actual_grid](*args)
++        return launch
++
++
++route_assign_decode_kernel=Kernel('route',_route_jit,[9,10,11,12],8)
++copy_quantized=Kernel('copy',_copy_jit,[6,7,12,13],6)
++
++NATIVE_ROUTE_AST='2115ebe5d2f23e63bed84c436d2ecb1fc63039246f72e5b7df0026167f01f1c7'
++NATIVE_COPY_AST='93bff9704b14531c159ce6f9048a68497a5b3acc60b387492731b1e093964042'
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_tail_down.py
+@@ -0,0 +1,115 @@
++import torch
++import hashlib
++import os
++import copy
++from triton.compiler.compiler import make_backend
++import json
++from pathlib import Path
++from triton.backends.compiler import GPUTarget
++import triton
++import triton.language as tl
++
++
++@triton.jit(do_not_specialize=['PAIRS','AS1'])
++def routed_gemm(Q,W,AS,BS,DST,IDS,OFF,Y,N:tl.constexpr,K:tl.constexpr,PAIRS,QS0:tl.constexpr,
++                AS0:tl.constexpr,AS1,BS0:tl.constexpr,BS1:tl.constexpr,BS2:tl.constexpr,
++                PACKED:tl.constexpr,PACKED_WS:tl.constexpr,BN:tl.constexpr,BK:tl.constexpr,SPLITS:tl.constexpr,BM:tl.constexpr):
++    pair=tl.program_id(1)
++    expert=tl.load(IDS+pair)
++    dest=tl.load(DST+pair)
++    if expert>=0:
++        first=tl.load(OFF+expert)
++        end=tl.load(OFF+expert+1)
++        if (dest-first)%BM==0:
++            row=dest+tl.arange(0,BM)
++            col=tl.program_id(0)*BN+tl.arange(0,BN)
++            ki=tl.arange(0,BK)
++            kp=tl.arange(0,BK//2)
++            groups=tl.arange(0,BK//32)
++            acc=tl.full((BM,BN),0,tl.float32)
++            for step in range(tl.cdiv(K,BK*SPLITS)):
++                begin=tl.program_id(2)*tl.cdiv(K,BK*SPLITS)+step
++                k=begin*BK+ki
++                a=tl.load(Q+row[:,None]*QS0+k[None,:],(row[:,None]<end)&(k[None,:]<K),0.0)
++                packed=begin*(BK//2)+kp
++                b=tl.load(W+expert*N*(K//2)+col[:,None]*(K//2)+packed[None,:],(col[:,None]<N)&(packed[None,:]<K//2),0)
++                group=begin*(BK//32)+groups
++                ag=group//4
++                if PACKED:
++                    word=tl.load(AS+row[:,None]*AS0+(ag[None,:]//4)*AS1,(row[:,None]<end)&(group[None,:]<K//32),0)
++                    a_scale=((word>>((ag[None,:]%4)*8))&255).to(tl.uint8)
++                else:
++                    scale=tl.load(AS+row[:,None]*AS0+ag[None,:]*AS1,(row[:,None]<end)&(group[None,:]<K//32),0.)
++                    a_scale=((scale.to(tl.int32,bitcast=True)>>23)&255).to(tl.uint8)
++                if PACKED_WS:
++                    word=tl.load(BS+expert*BS0+col[:,None]*BS1+(group[None,:]//4)*BS2,(col[:,None]<N)&(group[None,:]<K//32),0)
++                    b_scale=((word>>((group[None,:]%4)*8))&255).to(tl.uint8)
++                else:
++                    b_scale=tl.load(BS+expert*BS0+col[:,None]*BS1+group[None,:]*BS2,(col[:,None]<N)&(group[None,:]<K//32),0).to(tl.uint8)
++                low=(b&15)<<2
++                high=(b>>4)<<2
++                expanded=tl.interleave(low,high).to(tl.float8e4nv,bitcast=True)
++                acc=tl.dot_scaled(a,a_scale,'e4m3',tl.trans(expanded),b_scale,'e4m3',acc=acc)
++            tl.store(Y+tl.program_id(2)*PAIRS*N+row[:,None]*N+col[None,:],acc,(row[:,None]<end)&(col[None,:]<N))
++
++
++@triton.jit(do_not_specialize=['PAIRS'])
++def weighted_reduce(P,DST,RW,Y,N:tl.constexpr,PAIRS,TOPK:tl.constexpr,SPLITS:tl.constexpr,BLOCK:tl.constexpr):
++    token=tl.program_id(0)
++    cols=tl.program_id(1)*BLOCK+tl.arange(0,BLOCK)
++    total=tl.full((BLOCK,),0,tl.float32)
++    for slot in range(TOPK):
++        row=tl.load(DST+token*TOPK+slot)
++        weight=tl.load(RW+token*TOPK+slot)
++        value=tl.full((BLOCK,),0,tl.float32)
++        for split in range(SPLITS):
++            value+=tl.load(P+split*PAIRS*N+row*N+cols,(row>=0)&(cols<N),0)
++        value=value.to(tl.bfloat16).to(tl.float32)
++        total+=value*weight
++    tl.store(Y+token*N+cols,total,cols<N)
++
++
++_COMPILED={}
++_CALLS=0
++_SHAPES=set()
++
++
++def down(q,scales,weight,weight_scales,route,ids,weights,out,partial,tile_n=32,tile_k=128,splits=1,tile_m=16):
++    global _CALLS
++    _CALLS+=1
++    _SHAPES.add((ids.shape[0],ids.shape[1],q.shape[1],weight.shape[0]))
++    pairs=q.shape[0]
++    k=weight.shape[2]*2
++    n=weight.shape[1]
++    args=(q,weight,scales,weight_scales,route.dst_rows,ids,route.offsets,partial,n,k,pairs,q.stride(0),*scales.stride(),*weight_scales.stride(),scales.dtype==torch.int32,weight_scales.dtype==torch.int32,tile_n,tile_k,splits,tile_m)
++    grid=(triton.cdiv(n,tile_n),pairs,splits)
++    key=(n,k,q.stride(0),scales.stride(0),*weight_scales.stride(),scales.dtype,weight_scales.dtype,partial.dtype,tile_n,tile_k,splits,tile_m)
++    if key not in _COMPILED:
++        original=routed_gemm.warmup(*args,grid=grid,num_warps=4,num_stages=2)
++        ptx=original.asm['ptx']
++        source='.f32.e4m3.e4m3.f32.ue8m0'
++        replacement='.f32.e4m3.e2m1.f32.ue8m0'
++        assert source in ptx and replacement not in ptx
++        count=ptx.count(source)
++        patched_ptx=ptx.replace(source,replacement)
++        directory=Path(os.environ.get('TRITON_CACHE_DIR',str(Path.home()/'.triton/cache')))/'sm120_native_expert_mma';directory.mkdir(exist_ok=True,parents=True)
++        sha=hashlib.sha256(patched_ptx.encode()).hexdigest()
++        path=directory/(sha+'.ptx');path.write_text(patched_ptx)
++        backend=make_backend(GPUTarget('cuda',120,32))
++        options=backend.parse_options({'num_warps':4,'num_stages':2})
++        metadata=original.metadata._asdict()
++        binary=backend.make_cubin(patched_ptx,metadata,options,120)
++        patched=copy.copy(original)
++        patched.kernel=binary
++        patched.asm=dict(original.asm,ptx=patched_ptx,cubin=binary)
++        patched.hash=sha
++        patched.module=None
++        patched.function=None
++        patched._run=None
++        patched._init_handles()
++        _COMPILED[key]=patched
++        proof={'source_sha256':sha,'native_FP8_FP4_MMA_sites':count,'shared_bytes':original.metadata.shared,'registers':patched.n_regs,'spills':patched.n_spills,'scope':'Authored PTX operand format paired with zero-extended native FP4 nibbles; source kernel launcher and shared memory contract preserved'}
++        (directory/(sha+'.json')).write_text(json.dumps(proof,indent=2)+'\n')
++    _COMPILED[key][grid](*args)
++    weighted_reduce[(ids.shape[0],triton.cdiv(n,256))](partial,route.dst_rows,weights,out,n,pairs,ids.shape[1],splits,256,num_warps=4,enable_fp_fusion=False)
++    return out
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_compact_tail_quant.py
+@@ -0,0 +1,231 @@
++import torch
++import triton
++import triton.language as tl
++
++@triton.jit
++def _tail_silu_mul_quant_fp8_packed_kernel(
++    input_ptr,
++    output_q_ptr,
++    output_scale_ptr,
++    expert_ends_ptr,
++    M,
++    input_stride_m,
++    output_q_stride_m,
++    output_scale_stride_k,
++    clamp_limit,
++    alpha,
++    beta,
++    N: tl.constexpr,
++    OUTPUT_COLS: tl.constexpr,
++    GROUPS_PER_ROW: tl.constexpr,
++    PACKS_PER_ROW: tl.constexpr,
++    fp8_min: tl.constexpr,
++    fp8_max: tl.constexpr,
++    GROUP_SIZE: tl.constexpr,
++    PACKS_PER_CTA: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    HAS_CLAMP: tl.constexpr,
++    EXPERT_ALIGNMENT: tl.constexpr,
++):
++    GROUPS_PER_PACK: tl.constexpr = 4
++    hidden_size: tl.constexpr = N // 2
++
++    pack_tile = tl.program_id(0)
++    row_start = tl.program_id(1).to(tl.int64) * BLOCK_M
++    row_step = tl.num_programs(1).to(tl.int64) * BLOCK_M
++
++    if EXPERT_ALIGNMENT:
++        expert = tl.program_id(2)
++        previous_end = tl.load(expert_ends_ptr + expert - 1, expert > 0, other=0)
++        expert_start = tl.cdiv(previous_end, EXPERT_ALIGNMENT) * EXPERT_ALIGNMENT
++        row_start += expert_start.to(tl.int64)
++        M = tl.load(expert_ends_ptr + expert)
++
++    groups_per_cta: tl.constexpr = PACKS_PER_CTA * GROUPS_PER_PACK
++    elems_per_cta: tl.constexpr = groups_per_cta * GROUP_SIZE
++    col_start = pack_tile * elems_per_cta
++    col_offsets = tl.arange(0, elems_per_cta)
++    row_offsets = tl.arange(0, BLOCK_M)
++    pack_offsets = tl.arange(0, PACKS_PER_CTA)
++
++    col_mask = (col_start + col_offsets) < (GROUPS_PER_ROW * GROUP_SIZE)
++    input_col_mask = (col_start + col_offsets) < hidden_size
++
++    # persistent with grid_m-stride loop
++    while row_start < M:
++        rows = row_start + row_offsets
++        row_mask = rows < M
++        input_row_start = rows[:, None] * input_stride_m
++        output_row_start = rows[:, None] * output_q_stride_m
++
++        gate_flat = tl.load(
++            input_ptr + input_row_start + col_start + col_offsets[None, :],
++            mask=row_mask[:, None] & input_col_mask[None, :],
++            other=0.0,
++        )
++        up_flat = tl.load(
++            input_ptr
++            + input_row_start
++            + hidden_size
++            + col_start
++            + col_offsets[None, :],
++            mask=row_mask[:, None] & input_col_mask[None, :],
++            other=0.0,
++        )
++
++        gate = tl.reshape(gate_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(
++            tl.float32
++        )
++        up = tl.reshape(up_flat, (BLOCK_M, groups_per_cta, GROUP_SIZE)).to(tl.float32)
++
++        if HAS_CLAMP:
++            gate = tl.minimum(gate, clamp_limit)
++            up = tl.clamp(up, -clamp_limit, clamp_limit)
++
++        # Unified gated activation: silu == swigluoai with alpha=1, beta=0.
++        #   glu = gate * sigmoid(alpha * gate); y = (up + beta) * glu
++        glu = gate / (1.0 + tl.exp(-gate * alpha))
++        y = (up + beta) * glu
++        # Round through bf16 to match unfused precision path
++        y = y.to(tl.bfloat16).to(tl.float32)
++
++        absmax = tl.max(tl.abs(y), axis=2)
++        scale_raw = tl.maximum(absmax / fp8_max, 1e-10)
++        exponent = tl.ceil(tl.log2(scale_raw))
++        scale = tl.math.exp2(exponent)
++
++        y_q = tl.clamp(y / scale[:, :, None], fp8_min, fp8_max)
++
++        y_q_flat = tl.reshape(y_q, (BLOCK_M, elems_per_cta))
++        tl.store(
++            output_q_ptr + output_row_start + col_start + col_offsets[None, :],
++            y_q_flat.to(output_q_ptr.dtype.element_ty),
++            mask=row_mask[:, None] & col_mask[None, :] & ((col_start + col_offsets[None, :]) < OUTPUT_COLS),
++        )
++
++        scale_byte = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.int32)
++        scale_bytes = tl.reshape(scale_byte, (BLOCK_M, PACKS_PER_CTA, GROUPS_PER_PACK))
++        shifts = tl.arange(0, GROUPS_PER_PACK) * 8
++        packed_scale = tl.sum(scale_bytes << shifts[None, None, :], axis=2)
++
++        scale_pack = pack_tile * PACKS_PER_CTA + pack_offsets
++        scale_ptrs = (
++            output_scale_ptr
++            + scale_pack[None, :] * output_scale_stride_k
++            + rows[:, None]
++        )
++        tl.store(
++            scale_ptrs,
++            packed_scale,
++            mask=row_mask[:, None] & (scale_pack[None, :] < PACKS_PER_ROW),
++        )
++
++        row_start += row_step
++
++def quantize(
++    input: torch.Tensor,
++    group_size: int = 128,
++    output_q: torch.Tensor | None = None,
++    clamp_limit: float | None = None,
++    alpha: float = 1.0,
++    beta: float = 0.0,
++    *,
++    expert_ends: torch.Tensor | None = None,
++    expert_alignment: int = 0,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Fuse activation and FP8 quantization, optionally skipping expert padding.
++
++    ``expert_ends`` uses DeepGEMM's prefix-sum layout: each entry is the
++    exclusive end of an expert's live rows, including earlier alignment gaps.
++    An expert starts at the preceding end rounded up to ``expert_alignment``.
++    Padding outputs are left unwritten and must not be consumed as live rows.
++    Without ``expert_ends``, the original dense launch configuration is used
++    and the metadata loads are compiled out.
++    """
++    assert input.dim() == 2
++    assert input.is_contiguous()
++
++    M, N = input.shape
++    hidden_size = N // 2
++
++    assert hidden_size % 32 == 0 and group_size == 128
++
++    fp8_dtype = torch.float8_e4m3fn
++    finfo = torch.finfo(fp8_dtype)
++    fp8_min, fp8_max = finfo.min, finfo.max
++
++    groups_per_row = triton.cdiv(hidden_size, group_size)
++    groups_per_pack = 4  # pack 4 UE8M0 scales to a single INT32
++    packs_per_row = triton.cdiv(groups_per_row, groups_per_pack)
++
++    if output_q is None:
++        output_q = torch.empty((M, groups_per_row * group_size), dtype=fp8_dtype, device=input.device)
++
++    assert output_q.ndim == 2 and output_q.shape[0] == M
++    assert output_q.shape[1] >= hidden_size and output_q.stride(1) == 1
++
++    aligned_m = triton.cdiv(M, 4) * 4
++    output_scale_packed = torch.empty(
++        (packs_per_row, aligned_m),
++        dtype=torch.int32,
++        device=input.device,
++    ).T[:M, :]
++
++    # Tuned for group_size=32 (MXFP8) and group_size=128 (DeepSeek-V4)
++    num_warps = 4
++    num_stages = 2
++    if group_size < 128:
++        BM = 1
++        packs_per_cta = 8
++    else:
++        BM = 1 if M < 512 else 4
++        packs_per_cta = 2 if M < 512 else 1
++
++    grid_n = triton.cdiv(packs_per_row, packs_per_cta)
++    grid_m = min(triton.cdiv(M, BM), 4096)
++    grid: tuple[int, ...] = (grid_n, grid_m)
++    if expert_ends is not None:
++        assert expert_ends.ndim == 1 and expert_ends.numel() > 0
++        assert expert_ends.dtype == torch.int32
++        assert expert_ends.device == input.device and expert_ends.is_contiguous()
++        assert expert_alignment > 0
++        num_experts = expert_ends.numel()
++        # Bound empty CTAs while retaining enough parallelism for full experts.
++        max_ctas = 4096 if group_size < 128 else 8192
++        grid_m = min(
++            triton.cdiv(M, BM * num_experts),
++            max(1, triton.cdiv(max_ctas, grid_n * num_experts)),
++        )
++        grid = (grid_n, grid_m, num_experts)
++    else:
++        assert expert_alignment == 0
++
++    has_clamp = clamp_limit is not None
++    _tail_silu_mul_quant_fp8_packed_kernel[grid](
++        input,
++        output_q,
++        output_scale_packed,
++        expert_ends,
++        M,
++        input.stride(0),
++        output_q.stride(0),
++        output_scale_packed.stride(1),
++        clamp_limit if has_clamp else 0.0,
++        alpha,
++        beta,
++        N=N,
++        OUTPUT_COLS=output_q.shape[1],
++        GROUPS_PER_ROW=groups_per_row,
++        PACKS_PER_ROW=packs_per_row,
++        fp8_min=fp8_min,
++        fp8_max=fp8_max,
++        GROUP_SIZE=group_size,
++        PACKS_PER_CTA=packs_per_cta,
++        BLOCK_M=BM,
++        HAS_CLAMP=has_clamp,
++        EXPERT_ALIGNMENT=expert_alignment,
++        num_warps=num_warps,
++        num_stages=num_stages,
++    )
++
++    return output_q, output_scale_packed
 --- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/experts/sm120_grouped_moe.py
 @@ -0,0 +1,230 @@
@@ -734,6 +1568,353 @@
 +    )
 +    return output
 --- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_large_route.py
+@@ -0,0 +1,64 @@
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def count_experts(IDS, COUNTS, PAIRS: tl.constexpr, BLOCK: tl.constexpr):
++    expert = tl.program_id(0)
++    lane = tl.arange(0, BLOCK)
++    count = tl.full((), 0, tl.int32)
++    for block in range(tl.cdiv(PAIRS, BLOCK)):
++        index = block * BLOCK + lane
++        ids = tl.load(IDS + index, index < PAIRS, -1)
++        count += tl.sum((ids == expert).to(tl.int32), 0)
++    tl.store(COUNTS + expert, count)
++
++
++@triton.jit
++def prefix_counts(COUNTS, OFFSETS, EXPERTS: tl.constexpr, BLOCK: tl.constexpr):
++    expert = tl.arange(0, BLOCK)
++    counts = tl.load(COUNTS + expert, expert < EXPERTS, 0)
++    ends = tl.cumsum(counts)
++    tl.store(OFFSETS, 0)
++    tl.store(OFFSETS + expert + 1, ends, expert < EXPERTS)
++
++
++@triton.jit
++def scatter_expert(IDS, WEIGHTS, OFFSETS, TOKEN_MAP, TOKEN_WEIGHTS, DST, SF_DST,
++                   PAIRS: tl.constexpr, TOPK: tl.constexpr, EXPERTS: tl.constexpr,
++                   ALIGN: tl.constexpr, BLOCK: tl.constexpr):
++    expert = tl.program_id(0)
++    start = tl.load(OFFSETS + expert)
++    scale_start = (start + expert * (ALIGN - 1)) & -ALIGN
++    lane = tl.arange(0, BLOCK)
++    earlier = tl.full((), 0, tl.int32)
++    for block in range(tl.cdiv(PAIRS, BLOCK)):
++        index = block * BLOCK + lane
++        ids = tl.load(IDS + index, index < PAIRS, -1)
++        selected = (index < PAIRS) & (ids == expert)
++        prefix = tl.cumsum(selected.to(tl.int32))
++        rank = earlier + prefix - 1
++        row = start + rank
++        weight = tl.load(WEIGHTS + index, selected, 0)
++        tl.store(TOKEN_MAP + row, index // TOPK, selected)
++        tl.store(TOKEN_WEIGHTS + row, weight, selected)
++        tl.store(DST + index, row, selected)
++        tl.store(SF_DST + index, scale_start + rank, selected)
++        if expert == 0:
++            invalid = (index < PAIRS) & ((ids < 0) | (ids >= EXPERTS))
++            tl.store(DST + index, -1, invalid)
++            tl.store(SF_DST + index, -1, invalid)
++        earlier += tl.sum(selected.to(tl.int32), 0)
++
++
++def route_large(ids, weights, workspace, experts, align=128):
++    pairs = ids.numel()
++    workspace.scale_out.zero_()
++    count_experts[(experts,)](ids, workspace.counts, pairs, 1024, num_warps=4)
++    prefix_counts[(1,)](workspace.counts, workspace.offsets, experts,
++                        triton.next_power_of_2(experts), num_warps=4)
++    scatter_expert[(experts,)](ids, weights, workspace.offsets, workspace.token_map,
++                              workspace.token_weights, workspace.dst_rows,
++                              workspace.scale_dst_rows, pairs, ids.shape[1], experts,
++                              align, 1024, num_warps=4)
++    return workspace
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/experts/sm120_medium_moe.py
+@@ -0,0 +1,277 @@
++# SPDX-License-Identifier: Apache-2.0
++# Copyright (c) 2025 by FlashInfer team.
++
++import torch
++import triton
++import triton.language as tl
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
++    make_mxfp8_q0_route_workspace,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import (
++    prefix_cursor_kernel,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import (
++    SF_M_ALIGN,
++)
++from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import (
++    cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
++)
++from vllm.model_executor.layers.fused_moe.activation import MoEActivation
++
++
++@triton.jit(do_not_specialize=["total_pairs"])
++def _count_routes_dynamic(
++    topk_ids, counts, total_pairs, block_n: tl.constexpr
++):
++    pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
++    valid = pair_idx < total_pairs
++    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
++    tl.atomic_add(counts + expert, 1, mask=expert >= 0, sem="relaxed")
++
++@triton.jit(do_not_specialize=["total_pairs"])
++def _route_assign_dynamic(
++    topk_ids,
++    topk_weights,
++    offsets,
++    expert_cursor,
++    token_map,
++    token_weights,
++    dst_rows,
++    scale_dst_rows,
++    total_pairs,
++    top_k: tl.constexpr,
++    scale_align: tl.constexpr,
++    block_n: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = tl.arange(0, block_n)
++    pair_idx = pid * block_n + offs
++    valid = pair_idx < total_pairs
++    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
++    # Unrouted (negative id) pairs take no row; see the module docstring.
++    routed = expert >= 0
++    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=routed, sem="relaxed")
++    token_idx = pair_idx // top_k
++    expert_begin = tl.load(offsets + expert, mask=routed, other=0)
++    scale_begin = (expert_begin + expert * (scale_align - 1)) & -scale_align
++    tl.store(token_map + routed_row, token_idx, mask=routed)
++    tl.store(
++        token_weights + routed_row,
++        tl.load(topk_weights + pair_idx, mask=routed, other=0.0),
++        mask=routed,
++    )
++    tl.store(dst_rows + pair_idx, tl.where(routed, routed_row, -1), mask=valid)
++    tl.store(
++        scale_dst_rows + pair_idx,
++        tl.where(routed, scale_begin + routed_row - expert_begin, -1),
++        mask=valid,
++    )
++
++@triton.jit(do_not_specialize=["N"])
++def _map_ids_dynamic(IDS, MAP, LOCAL, N, BLOCK: tl.constexpr):
++    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    expert = tl.load(IDS + r, r < N, -1)
++    local = tl.load(MAP + expert, (r < N) & (expert >= 0), -1)
++    tl.store(LOCAL + r, local, r < N)
++
++
++@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
++def _copy_quantized_dynamic(
++    X,
++    XS,
++    DST,
++    SFDST,
++    Q,
++    SF,
++    K: tl.constexpr,
++    TOPK: tl.constexpr,
++    XS0,
++    XS1,
++    SF0,
++    SF1,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    block = tl.program_id(1)
++    token = route // TOPK
++    dest = tl.load(DST + route)
++    sfrow = tl.load(SFDST + route)
++    cols = block * BLOCK + tl.arange(0, BLOCK)
++    x = tl.load(X + token * K + cols, cols < K, 0)
++    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
++    for part in tl.static_range(BLOCK // 512):
++        word = block * (BLOCK // 512) + part
++        if PACKED_XS:
++            scale = tl.load(
++                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
++            )
++        else:
++            scale = tl.full((), 0, tl.int32)
++            for group in tl.static_range(4):
++                sf = tl.load(
++                    XS + token * XS0 + (word * 4 + group) * XS1,
++                    word * 4 + group < triton.cdiv(K, 128),
++                    0,
++                )
++                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++                scale = scale | exponent << group * 8
++        tl.store(
++            SF + word * SF0 + sfrow * SF1,
++            scale,
++            (word < triton.cdiv(K, 512)) & (dest >= 0),
++        )
++
++
++@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
++def _copy_scales_dynamic(
++    XS,
++    DST,
++    SFDST,
++    SF,
++    K: tl.constexpr,
++    XS0,
++    XS1,
++    SF0,
++    SF1,
++    PACKED_XS: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    route = tl.program_id(0)
++    source = tl.load(DST + route)
++    dest = tl.load(SFDST + route)
++    word = tl.arange(0, BLOCK)
++    valid = (source >= 0) & (word < triton.cdiv(K, 512))
++    if PACKED_XS:
++        scale = tl.load(XS + source * XS0 + word * XS1, valid, 0)
++    else:
++        scale = tl.full((BLOCK,), 0, tl.int32)
++        for group in tl.static_range(4):
++            sf = tl.load(
++                XS + source * XS0 + (word * 4 + group) * XS1,
++                (source >= 0) & (word * 4 + group < triton.cdiv(K, 128)),
++                0,
++            )
++            exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
++            scale = scale | exponent << group * 8
++    tl.store(SF + word * SF0 + dest * SF1, scale, valid)
++
++
++@triton.jit
++def _reduce(Y, DST, RW, OUT, K: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
++    token = tl.program_id(0)
++    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++    value = tl.full((BLOCK,), 0, tl.float32)
++    for slot in range(TOPK):
++        row = tl.load(DST + token * TOPK + slot)
++        weight = tl.load(RW + token * TOPK + slot)
++        x = tl.load(Y + row * K + cols, (row >= 0) & (cols < K), 0).to(tl.float32)
++        value += x * weight
++    tl.store(OUT + token * K + cols, value, cols < K)
++
++
++def prepare(experts, w1, w2):
++    source = (experts.w1_scale.data_ptr(), experts.w2_scale.data_ptr())
++    if getattr(experts, "_sm120_grouped_source", None) != source:
++        experts._sm120_grouped_scales = (
++            experts.w1_scale.permute(0, 2, 1).contiguous(),
++            experts.w2_scale.permute(0, 2, 1).contiguous(),
++        )
++        experts._sm120_grouped_source = source
++
++
++_SM120_MEDIUM_SHAPES = set()
++
++def small_moe(
++    experts,
++    output,
++    x,
++    w1,
++    w2,
++    weights,
++    ids,
++    expert_map,
++    x_scale,
++    workspace,
++    bn=4,
++    bk=256,
++):
++    prepare(experts, w1, w2)
++    b, ds = experts._sm120_grouped_scales
++    a, down = (w1, w2)
++    m, k = x.shape
++    _SM120_MEDIUM_SHAPES.add((m,w1.shape[0],w1.shape[1]//2,ids.shape[1]))
++    topk = ids.shape[1]
++    pairs = ids.numel()
++    mapped = torch.empty_like(ids)
++    _map_ids_dynamic[triton.cdiv(pairs,256),](
++        ids, expert_map, mapped, pairs, 256, num_warps=4
++    )
++    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
++    counts = torch.zeros(w1.shape[0], device=x.device, dtype=torch.int32)
++    cursor = torch.empty_like(counts)
++    route.scale_out.zero_()
++    _count_routes_dynamic[triton.cdiv(pairs,256),](
++        mapped, counts, pairs, 256, num_warps=4,
++    )
++    prefix_cursor_kernel[1,](
++        counts, route.offsets, cursor, w1.shape[0],
++        triton.next_power_of_2(w1.shape[0]), num_warps=4,
++    )
++    _route_assign_dynamic[triton.cdiv(pairs,256),](
++        mapped, weights, route.offsets, cursor, route.token_map,
++        route.token_weights, route.dst_rows, route.scale_dst_rows,
++        pairs, topk, SF_M_ALIGN, 256, num_warps=4,
++    )
++    _copy_quantized_dynamic[pairs, triton.cdiv(k, 1024)](
++        x.view(torch.uint8),
++        x_scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        route.q_out.view(torch.uint8),
++        route.scale_out,
++        k,
++        topk,
++        *x_scale.stride(),
++        *route.scale_out.stride(),
++        x_scale.dtype == torch.int32,
++        1024,
++        num_warps=4,
++    )
++    tile = (max(32, min(128, triton.next_power_of_2(triton.cdiv(pairs, expert_map.numel())))), 128, 128)
++    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
++        route.q_out, route.scale_out, a, b, route.offsets, tile=tile, tune=False
++    )
++    intermediate = w1.shape[1] // 2
++    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
++    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
++    sf2 = torch.zeros(
++        (triton.cdiv(intermediate, 512), route.scale_out.shape[1]),
++        device=x.device,
++        dtype=torch.int32,
++    )
++    _copy_scales_dynamic[pairs,](
++        scale,
++        route.dst_rows,
++        route.scale_dst_rows,
++        sf2,
++        intermediate,
++        *scale.stride(),
++        *sf2.stride(),
++        scale.dtype == torch.int32,
++        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
++        num_warps=4,
++    )
++    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tile=tile, tune=False)
++    _reduce[m, triton.cdiv(k, 256)](
++        y,
++        route.dst_rows,
++        weights,
++        output,
++        k,
++        topk,
++        256,
++        num_warps=4,
++        enable_fp_fusion=False,
++    )
++    return output
+--- /dev/null
 +++ b/vllm/model_executor/layers/fused_moe/experts/sm120_small_moe.py
 @@ -0,0 +1,133 @@
 +import torch
@@ -869,6 +2050,87 @@
 +        k, intermediate, topk, *scale.stride(), *w2.stride(), *experts.w2_scale.stride(),
 +        *ids.stride(), *weights.stride(), expert_map is not None, bn, bk,
 +        num_warps=4, enable_fp_fusion=False)
+--- a/vllm/model_executor/layers/fused_moe/layer.py
++++ b/vllm/model_executor/layers/fused_moe/layer.py
+@@ -61,6 +61,26 @@
+         sp_size_=sp_size,
+         vllm_parallel_config=parallel_config,
+     )
++
++    import os
++
++    expert_tp = os.environ.get("VLLM_SM120_EXPERT_TP", "1")
++    if expert_tp != "1":
++        if not (
++            expert_tp in ("2", "4")
++            and (tp_size_ == 8 or (tp_size_ == 4 and expert_tp == "4"))
++            and dp_size_ == 1
++            and pcp_size_ == 1
++            and moe_parallel_config.use_ep
++            and not moe_parallel_config.enable_eplb
++            and moe_parallel_config.all2all_backend == "allgather_reducescatter"
++        ):
++            raise ValueError("Unsupported sm120 expert tensor-parallel layout")
++        transport_rank = moe_parallel_config.ep_rank
++        moe_parallel_config.tp_size = int(expert_tp)
++        moe_parallel_config.tp_rank = transport_rank % int(expert_tp)
++        moe_parallel_config.ep_size //= int(expert_tp)
++        moe_parallel_config.ep_rank = transport_rank // int(expert_tp)
+ 
+     assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
+ 
+@@ -376,6 +396,10 @@
+         skip_final_all_reduce=skip_final_all_reduce,
+     )
+ 
++    import os
++    if os.environ.get("VLLM_SM120_EXPERT_TP") == "4":
++        moe_config.tp_shard_with_padding = True
++
+     logger.debug("FusedMoEConfig = %s", moe_config)
+ 
+     # Create RoutedExperts instance BEFORE create_weights()
+--- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+@@ -86,6 +86,7 @@
+     w13_weight_scale: torch.Tensor,
+     w2_weight_scale: torch.Tensor,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
++    import os
+     from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+         deepgemm_post_process_weight_scale_block,
+     )
+@@ -95,6 +96,11 @@
+     hidden_size = w13_weight.shape[2] * 2  # weight is FP4-packed
+     intermediate_size = w2_weight.shape[2] * 2  # weight is FP4-packed
+     block_shape = (1, 32)  # MXFP4 block (per-row, K=32)
++    if (os.environ.get("VLLM_SM120_COMPACT_EXPERTS") == "1"
++            and current_platform.is_device_capability_family(120)
++            and hidden_size == 5120 and intermediate_size == 576):
++        w2_weight_scale = torch.nn.functional.pad(w2_weight_scale, (0, 2))
++        intermediate_size = 640
+ 
+     return (
+         deepgemm_post_process_weight_scale_block(
+@@ -820,6 +826,7 @@
+     activation: MoEActivation | None = None,
+ ) -> tuple[int, int]:
+     """Round up hidden_size and intermediate_size based on backend requirements."""
++    import os
+     if backend in FLASHINFER_MOE_EP_MXFP4_BACKENDS:
+         # The megakernel takes the model's dimensions and validates them itself.
+         return hidden_size, intermediate_size
+@@ -834,6 +841,10 @@
+         intermediate_size = round_up(intermediate_size, OCP_MX_BLOCK_SIZE)
+         hidden_size = round_up(hidden_size, OCP_MX_BLOCK_SIZE)
+     elif backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
++        if (os.environ.get("VLLM_SM120_COMPACT_EXPERTS") == "1"
++                and current_platform.is_device_capability_family(120)
++                and hidden_size == 5120 and intermediate_size == 576):
++            return hidden_size, intermediate_size
+         # DeepGEMM requires M/N/K alignment
+         intermediate_size = round_up(intermediate_size, 128)
+         hidden_size = round_up(hidden_size, 128)
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -41,6 +41,7 @@
@@ -1086,6 +2348,215 @@
  
          if needs_padded_path:
              # if padded, we need to unpack
+--- a/vllm/model_executor/warmup/kernel_warmup.py
++++ b/vllm/model_executor/warmup/kernel_warmup.py
+@@ -464,7 +464,33 @@
+     # which lead to some EP ranks receiving no tokens and skipping their
+     # MoE kernel entirely, and cause hang due to all-reduce collective
+     # during synchronized autotuning.
++    import os
++    if os.environ.get("VLLM_SM120_FROZEN_CACHE_SOURCE") and not cache_path.is_file():
++        import hashlib,json
++        from pathlib import Path
++        source_root=Path(os.environ["VLLM_SM120_FROZEN_CACHE_SOURCE"])
++        choices=sorted(source_root.rglob(f"*_rank{world.rank_in_group}.json"))
++        assert len(choices)==1,choices
++        cache_path.parent.mkdir(parents=True,exist_ok=True)
++        cache_path.write_bytes(choices[0].read_bytes())
++        assert cache_path.read_bytes()==choices[0].read_bytes()
++        audit_root=Path(os.environ["POLICY_AUDIT_DIR"])
++        (audit_root/f"frozen-cache-rekey-rank{world.rank_in_group}.json").write_text(json.dumps({"source":str(choices[0]),"destination":str(cache_path),"sha256":hashlib.sha256(cache_path.read_bytes()).hexdigest(),"byte_identical":True})+"\n")
+     if _all_ranks_have_matching_cache(cache_path, tune_group):
++        import os, json, hashlib
++        from pathlib import Path
++        if os.environ.get("VLLM_SM120_FROZEN_AUTOTUNE") == "1":
++            audit_dir = Path(os.environ["POLICY_AUDIT_DIR"])
++            before_path = audit_dir / f"pre-frozen-cache-rank{world.rank_in_group}.json"
++            tuner.save_configs(str(before_path))
++            memory_entries = len(tuner.profiling_cache)
++            tuner.clear_cache()
++            (audit_dir / f"frozen-cache-reset-rank{world.rank_in_group}.json").write_text(
++                json.dumps({"rank": world.rank_in_group, "memory_winner_entries_before_clear": memory_entries,
++                            "memory_winner_entries_after_clear": len(tuner.profiling_cache),
++                            "loaded_file": str(cache_path), "cache_file_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
++                            "reason": "In-memory pre-profile winners precede loaded file decisions; clear before loading the fixed control tactics"}, indent=2) + "\n"
++            )
+         loaded = tuner.load_configs(str(cache_path))
+         if tune_group.world_size > 1:
+             loaded_by_rank: list[bool | None] = [None] * tune_group.world_size
+--- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
++++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
+@@ -95,11 +95,14 @@
+         )
+     else:
+         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
+-        torch.bmm(
+-            o_proj_input.transpose(0, 1),
+-            grouped_weight.transpose(1, 2),
+-            out=z.transpose(0, 1),
+-        )
++        from vllm.models.deepseek_v4.nvidia.ops.sm120_wo_a_mma import small_g2
++
++        if not small_g2(o_proj_input, grouped_weight, z):
++            torch.bmm(
++                o_proj_input.transpose(0, 1),
++                grouped_weight.transpose(1, 2),
++                out=z.transpose(0, 1),
++            )
+     return wo_b(z.flatten(1))
+ 
+ 
+--- /dev/null
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu
+@@ -0,0 +1,91 @@
++#include <cuda_runtime.h>
++#include <cuda_bf16.h>
++#include <stdint.h>
++
++template<int Warps, int Splits>
++__global__ void woa_bf16_mma(const uint32_t* __restrict__ x,
++        const uint32_t* __restrict__ w, __nv_bfloat16* __restrict__ out,
++        float* __restrict__ partial, int m, int64_t xt, int64_t xg) {
++    const int lane = threadIdx.x & 31;
++    const int group = lane / 4;
++    const int part = lane % 4;
++    const int nbase = (blockIdx.x * Warps + threadIdx.x / 32) * 8;
++    const int batch = blockIdx.y;
++    const int split = blockIdx.z;
++    const int begin = split * (4096 / Splits);
++    const int end = begin + 4096 / Splits;
++    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
++    #pragma unroll 2
++    for (int k = begin; k < end; k += 16) {
++        const int kp = k / 2 + part;
++        const uint32_t a0 = group < m ? x[(group * xt + batch * xg) / 2 + kp] : 0;
++        const uint32_t a2 = group < m ? x[(group * xt + batch * xg) / 2 + kp + 4] : 0;
++        const uint32_t b0 = w[(batch * 1024 + nbase + group) * 2048 + kp];
++        const uint32_t b1 = w[(batch * 1024 + nbase + group) * 2048 + kp + 4];
++        asm volatile(
++            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
++            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
++            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
++            : "r"(a0), "r"(uint32_t(0)), "r"(a2), "r"(uint32_t(0)), "r"(b0), "r"(b1));
++    }
++    if (group < m) {
++        const int index = (group * 2 + batch) * 1024 + nbase + 2 * part;
++        if constexpr (Splits == 1) {
++            out[index] = __float2bfloat16_rn(c0);
++            out[index + 1] = __float2bfloat16_rn(c1);
++        } else {
++            const int offset = split * m * 2 * 1024 + index;
++            partial[offset] = c0;
++            partial[offset + 1] = c1;
++        }
++    }
++}
++
++template<int Splits>
++__global__ void woa_mma_reduce(const float* __restrict__ partial,
++                             __nv_bfloat16* __restrict__ out, int count) {
++    const int index = blockIdx.x * blockDim.x + threadIdx.x;
++    if (index >= count) return;
++    float sum = 0;
++    #pragma unroll
++    for (int split = 0; split < Splits; ++split)
++        sum += partial[split * count + index];
++    out[index] = __float2bfloat16_rn(sum);
++}
++
++template<int Warps, int Splits>
++int launch_mma(void* x, void* w, void* out, void* partial, int m,
++               int64_t xt, int64_t xg, cudaStream_t stream) {
++    woa_bf16_mma<Warps, Splits><<<dim3(1024 / (Warps * 8), 2, Splits), Warps * 32, 0, stream>>>(
++        static_cast<const uint32_t*>(x), static_cast<const uint32_t*>(w),
++        static_cast<__nv_bfloat16*>(out), static_cast<float*>(partial), m, xt, xg);
++    cudaError_t error = cudaGetLastError();
++    if (error != cudaSuccess) return int(error);
++    if constexpr (Splits > 1) {
++        const int count = m * 2 * 1024;
++        woa_mma_reduce<Splits><<<(count + 255) / 256, 256, 0, stream>>>(
++            static_cast<const float*>(partial), static_cast<__nv_bfloat16*>(out), count);
++    }
++    return int(cudaGetLastError());
++}
++
++template<int Warps>
++int dispatch_mma(void* x, void* w, void* out, void* partial, int m,
++                 int64_t xt, int64_t xg, int splits, cudaStream_t stream) {
++    if (splits == 1) return launch_mma<Warps, 1>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 2) return launch_mma<Warps, 2>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 4) return launch_mma<Warps, 4>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 8) return launch_mma<Warps, 8>(x, w, out, partial, m, xt, xg, stream);
++    if (splits == 16) return launch_mma<Warps, 16>(x, w, out, partial, m, xt, xg, stream);
++    return int(cudaErrorInvalidValue);
++}
++
++extern "C" int launch_woa(void* x, void* w, void* out, void* partial, int m,
++        int64_t xt, int64_t xg, int warps, int splits, void* stream) {
++    if (m < 1 || m > 8 || (xt & 1) || (xg & 1) || xt <= 0 || xg <= 0)
++        return int(cudaErrorInvalidValue);
++    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++    if (warps == 4) return dispatch_mma<4>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
++    if (warps == 8) return dispatch_mma<8>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
++    return int(cudaErrorInvalidValue);
++}
+--- /dev/null
++++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.py
+@@ -0,0 +1,54 @@
++import ctypes
++from functools import lru_cache
++
++import torch
++
++
++@lru_cache(None)
++def _supported_device(device):
++    return (
++        torch.cuda.get_device_capability(device) == (12, 0)
++        and torch.cuda.get_device_properties(device).multi_processor_count == 188
++    )
++
++
++@lru_cache(None)
++def _library():
++    library = ctypes.CDLL("/usr/local/lib/libvllm-sm120-g2-wo-a-mma.so")
++    library.launch_woa.argtypes = [ctypes.c_void_p] * 4 + [
++        ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
++        ctypes.c_int, ctypes.c_void_p,
++    ]
++    library.launch_woa.restype = ctypes.c_int
++    return library
++
++
++def small_g2(x, weight, output):
++    if not (
++        x.is_cuda and weight.device == output.device == x.device
++        and x.dtype == weight.dtype == output.dtype == torch.bfloat16
++        and x.ndim == weight.ndim == output.ndim == 3
++        and 1 <= x.shape[0] <= 4
++        and x.shape[1:] == (2, 4096)
++        and weight.shape == (2, 1024, 4096)
++        and output.shape == (x.shape[0], 2, 1024)
++        and weight.is_contiguous() and output.is_contiguous()
++        and x.stride(-1) == 1
++        and x.stride(0) > 0 and x.stride(0) % 2 == 0
++        and x.stride(1) > 0 and x.stride(1) % 2 == 0
++        and x.data_ptr() % 4 == 0 and weight.data_ptr() % 4 == 0
++        and output.data_ptr() % 2 == 0
++        and _supported_device(x.device)
++    ):
++        return False
++    partial = torch.empty(
++        (16, x.shape[0], 2, 1024), device=x.device, dtype=torch.float32
++    )
++    error = _library().launch_woa(
++        x.data_ptr(), weight.data_ptr(), output.data_ptr(), partial.data_ptr(),
++        x.shape[0], x.stride(0), x.stride(1), 8, 16,
++        torch.cuda.current_stream(x.device).cuda_stream,
++    )
++    if error:
++        raise RuntimeError(f"sm120 G2 BF16 WO-A launch failed: {error}")
++    return True
 --- a/vllm/models/deepseek_v41/attention.py
 +++ b/vllm/models/deepseek_v41/attention.py
 @@ -119,14 +119,14 @@
@@ -1405,6 +2876,151 @@
          and has_deep_gemm()
      )
  
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1595,6 +1595,11 @@
+         input_batch: InputBatch,
+         grammar_output: GrammarOutput | None,
+     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
++        from vllm.v1.worker.gpu.sm120_target_greedy import try_sample
++        greedy_output = try_sample(self, hidden_states, input_batch, grammar_output)
++        if greedy_output is not None:
++            return greedy_output, greedy_output.num_sampled, greedy_output.num_rejected
++
+         shard_metadata = None
+         global_input_batch = input_batch
+         if self.batch_sharder is not None:
+--- /dev/null
++++ b/vllm/v1/worker/gpu/sm120_target_greedy.py
+@@ -0,0 +1,128 @@
++import os
++
++import numpy as np
++import torch
++
++from vllm.distributed import tensor_model_parallel_all_gather
++from vllm.triton_utils import tl, triton
++from vllm.v1.worker.gpu.sample.output import SamplerOutput
++
++_ENABLED = os.environ.get('VLLM_SM120_TARGET_GREEDY') == '1'
++_FAST_CALLS = 0
++_FALLBACK_CALLS = 0
++
++
++@triton.jit
++def _pack_argmax(Logits, Pairs, stride, count, start, BLOCK: tl.constexpr):
++    row = tl.program_id(0)
++    col = tl.arange(0, BLOCK)
++    values = tl.load(Logits + row * stride + col, col < count, other=-float('inf')).to(tl.float32)
++    best = tl.max(values, 0)
++    index = tl.min(tl.where((col < count) & (values == best), col, 2147483647), 0)
++    tl.store(Pairs + row * 2, best)
++    tl.store(Pairs + row * 2 + 1, (index + start).to(tl.float32))
++
++
++@triton.jit
++def _verify_pairs(Pairs, Cu, Idx, Input, Positions, LogitIndices, LocalPos,
++                  Prefill, SeqLens, Sampled, Counts, Rejected,
++                  TP: tl.constexpr, STEPS: tl.constexpr, WIDTH: tl.constexpr):
++    req = tl.program_id(0)
++    begin = tl.load(Cu + req)
++    end = tl.load(Cu + req + 1)
++    state = tl.load(Idx + req)
++    prefill = tl.load(Prefill + state)
++    step = tl.arange(0, WIDTH)
++    rank = tl.arange(0, TP)
++    row = begin + step
++    values = tl.load(Pairs + row[:, None] * (TP * 2) + rank[None, :] * 2,
++                     row[:, None] < end, other=-float('inf'))
++    ids = tl.load(Pairs + row[:, None] * (TP * 2) + rank[None, :] * 2 + 1,
++                  row[:, None] < end, other=2147483647).to(tl.int64)
++    best = tl.max(values, 1)
++    target = tl.min(tl.where(values == best[:, None], ids, 2147483647), 1)
++    next_row = row + 1
++    next_valid = next_row < end
++    next_index = tl.load(LogitIndices + next_row, next_valid, other=0)
++    draft = tl.load(Input + next_index, next_valid, other=-1).to(tl.int64)
++    pos = tl.load(Positions + next_index, next_valid, other=0)
++    local = tl.load(LocalPos + next_row, next_valid, other=0)
++    placeholder = (local > 0) & (pos - local < prefill)
++    mismatch = next_valid & ((target != draft) | (draft < 0) | placeholder)
++    length = tl.min(tl.where(mismatch, step, end - begin - 1), 0)
++    tl.store(Sampled + req * (STEPS + 1) + step,
++             tl.where(step <= length, target, -1), step < STEPS + 1)
++    chunked = tl.load(SeqLens + req) < prefill
++    count = tl.where(chunked, 0, length + 1)
++    tl.store(Counts + req, count)
++    tl.store(Rejected + req, tl.where(chunked, 0, end - begin - count))
++
++
++def pack_argmax(logits, count, start):
++    pairs = torch.empty((logits.shape[0], 2), dtype=torch.float32, device=logits.device)
++    _pack_argmax[(logits.shape[0],)](logits, pairs, logits.stride(0), count, start,
++                                  BLOCK=triton.next_power_of_2(count), num_warps=8)
++    return pairs
++
++
++def verify_pairs(pairs, batch, prefill, steps, tp):
++    sampled = torch.empty((batch.num_reqs, steps + 1), dtype=torch.int64, device=pairs.device)
++    counts = torch.empty(batch.num_reqs, dtype=torch.int32, device=pairs.device)
++    rejected = torch.empty_like(counts)
++    _verify_pairs[(batch.num_reqs,)](
++        pairs, batch.cu_num_logits, batch.idx_mapping, batch.input_ids,
++        batch.positions, batch.logits_indices, batch.expanded_local_pos,
++        prefill, batch.seq_lens, sampled, counts, rejected,
++        TP=tp, STEPS=steps, WIDTH=triton.next_power_of_2(steps + 1), num_warps=4)
++    return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None,
++                         num_nans=None, num_sampled=counts, num_rejected=rejected,
++                         sampling_mask_tensors=None)
++
++
++def try_sample(runner, hidden, batch, grammar):
++    global _FAST_CALLS, _FALLBACK_CALLS
++    if not _ENABLED:
++        return None
++    result = _try_sample(runner, hidden, batch, grammar)
++    if result is None:
++        _FALLBACK_CALLS += 1
++    else:
++        _FAST_CALLS += 1
++    return result
++
++
++def _try_sample(runner, hidden, batch, grammar):
++    if batch.num_reqs == 0 or grammar is not None or batch.has_structured_output_reqs:
++        return None
++    sampler = runner.sampler
++    model = getattr(runner.model, "language_model", runner.model)
++    if (sampler is None or runner.batch_sharder is not None or runner.lora_config is not None
++            or type(model).__name__ != 'DeepseekV41LLMForCausalLM'
++            or sampler.compute_nans or sampler.return_sampling_mask
++            or sampler.trace_replay_state is not None
++            or type(sampler).__name__ != 'Sampler'):
++        return None
++    mapping = batch.idx_mapping_np
++    if (np.any(sampler.sampling_states.temperature.np[mapping] != 0)
++            or np.any(sampler.needs_logits_processing[mapping])
++            or sampler.get_logprobs_dims(mapping) is not None):
++        return None
++    rejection = runner.rejection_sampler
++    if rejection is not None and (rejection.synthetic_conditional_rates is not None
++                                  or rejection.use_block_verification
++                                  or rejection.watermark_key is not None):
++        return None
++    steps = runner.num_speculative_steps
++    if steps > 8 or torch.cuda.get_device_capability(hidden.device) != (12, 0):
++        return None
++    head = model.lm_head
++    if head.tp_size not in (4, 8) or model.logits_processor.org_vocab_size >= 2**24:
++        return None
++    indices = head.shard_indices
++    if getattr(indices, 'num_added_vocab', 0) != 0 or model.logits_processor.org_vocab_size != model.logits_processor.vocab_size:
++        return None
++    logits = model.compute_logits_local(hidden[batch.logits_indices])
++    count = logits.shape[1] - indices.num_org_vocab_padding
++    pairs = pack_argmax(logits, count, indices.org_vocab_start_index)
++    gathered = tensor_model_parallel_all_gather(pairs, dim=-1)
++    return verify_pairs(gathered, batch, sampler.req_states.prefill_len.gpu, steps, head.tp_size)
 --- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -113,6 +113,20 @@
@@ -1462,552 +3078,3 @@
              self.draft_tokens[:num_reqs, i] = draft_sampled_i
              prev = draft_sampled_i
  
---- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-+++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-@@ -95,11 +95,14 @@
-         )
-     else:
-         grouped_weight = wo_a.weight.view(n_groups, o_lora_rank, -1)
--        torch.bmm(
--            o_proj_input.transpose(0, 1),
--            grouped_weight.transpose(1, 2),
--            out=z.transpose(0, 1),
--        )
-+        from vllm.models.deepseek_v4.nvidia.ops.sm120_wo_a_mma import small_g2
-+
-+        if not small_g2(o_proj_input, grouped_weight, z):
-+            torch.bmm(
-+                o_proj_input.transpose(0, 1),
-+                grouped_weight.transpose(1, 2),
-+                out=z.transpose(0, 1),
-+            )
-     return wo_b(z.flatten(1))
- 
- 
---- a/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.py
-+++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.py
-@@ -0,0 +1,54 @@
-+import ctypes
-+from functools import lru_cache
-+
-+import torch
-+
-+
-+@lru_cache(None)
-+def _supported_device(device):
-+    return (
-+        torch.cuda.get_device_capability(device) == (12, 0)
-+        and torch.cuda.get_device_properties(device).multi_processor_count == 188
-+    )
-+
-+
-+@lru_cache(None)
-+def _library():
-+    library = ctypes.CDLL("/usr/local/lib/libvllm-sm120-g2-wo-a-mma.so")
-+    library.launch_woa.argtypes = [ctypes.c_void_p] * 4 + [
-+        ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_int,
-+        ctypes.c_int, ctypes.c_void_p,
-+    ]
-+    library.launch_woa.restype = ctypes.c_int
-+    return library
-+
-+
-+def small_g2(x, weight, output):
-+    if not (
-+        x.is_cuda and weight.device == output.device == x.device
-+        and x.dtype == weight.dtype == output.dtype == torch.bfloat16
-+        and x.ndim == weight.ndim == output.ndim == 3
-+        and 1 <= x.shape[0] <= 4
-+        and x.shape[1:] == (2, 4096)
-+        and weight.shape == (2, 1024, 4096)
-+        and output.shape == (x.shape[0], 2, 1024)
-+        and weight.is_contiguous() and output.is_contiguous()
-+        and x.stride(-1) == 1
-+        and x.stride(0) > 0 and x.stride(0) % 2 == 0
-+        and x.stride(1) > 0 and x.stride(1) % 2 == 0
-+        and x.data_ptr() % 4 == 0 and weight.data_ptr() % 4 == 0
-+        and output.data_ptr() % 2 == 0
-+        and _supported_device(x.device)
-+    ):
-+        return False
-+    partial = torch.empty(
-+        (16, x.shape[0], 2, 1024), device=x.device, dtype=torch.float32
-+    )
-+    error = _library().launch_woa(
-+        x.data_ptr(), weight.data_ptr(), output.data_ptr(), partial.data_ptr(),
-+        x.shape[0], x.stride(0), x.stride(1), 8, 16,
-+        torch.cuda.current_stream(x.device).cuda_stream,
-+    )
-+    if error:
-+        raise RuntimeError(f"sm120 G2 BF16 WO-A launch failed: {error}")
-+    return True
---- a/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu
-+++ b/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_mma.cu
-@@ -0,0 +1,91 @@
-+#include <cuda_runtime.h>
-+#include <cuda_bf16.h>
-+#include <stdint.h>
-+
-+template<int Warps, int Splits>
-+__global__ void woa_bf16_mma(const uint32_t* __restrict__ x,
-+        const uint32_t* __restrict__ w, __nv_bfloat16* __restrict__ out,
-+        float* __restrict__ partial, int m, int64_t xt, int64_t xg) {
-+    const int lane = threadIdx.x & 31;
-+    const int group = lane / 4;
-+    const int part = lane % 4;
-+    const int nbase = (blockIdx.x * Warps + threadIdx.x / 32) * 8;
-+    const int batch = blockIdx.y;
-+    const int split = blockIdx.z;
-+    const int begin = split * (4096 / Splits);
-+    const int end = begin + 4096 / Splits;
-+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-+    #pragma unroll 2
-+    for (int k = begin; k < end; k += 16) {
-+        const int kp = k / 2 + part;
-+        const uint32_t a0 = group < m ? x[(group * xt + batch * xg) / 2 + kp] : 0;
-+        const uint32_t a2 = group < m ? x[(group * xt + batch * xg) / 2 + kp + 4] : 0;
-+        const uint32_t b0 = w[(batch * 1024 + nbase + group) * 2048 + kp];
-+        const uint32_t b1 = w[(batch * 1024 + nbase + group) * 2048 + kp + 4];
-+        asm volatile(
-+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
-+            : "r"(a0), "r"(uint32_t(0)), "r"(a2), "r"(uint32_t(0)), "r"(b0), "r"(b1));
-+    }
-+    if (group < m) {
-+        const int index = (group * 2 + batch) * 1024 + nbase + 2 * part;
-+        if constexpr (Splits == 1) {
-+            out[index] = __float2bfloat16_rn(c0);
-+            out[index + 1] = __float2bfloat16_rn(c1);
-+        } else {
-+            const int offset = split * m * 2 * 1024 + index;
-+            partial[offset] = c0;
-+            partial[offset + 1] = c1;
-+        }
-+    }
-+}
-+
-+template<int Splits>
-+__global__ void woa_mma_reduce(const float* __restrict__ partial,
-+                             __nv_bfloat16* __restrict__ out, int count) {
-+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-+    if (index >= count) return;
-+    float sum = 0;
-+    #pragma unroll
-+    for (int split = 0; split < Splits; ++split)
-+        sum += partial[split * count + index];
-+    out[index] = __float2bfloat16_rn(sum);
-+}
-+
-+template<int Warps, int Splits>
-+int launch_mma(void* x, void* w, void* out, void* partial, int m,
-+               int64_t xt, int64_t xg, cudaStream_t stream) {
-+    woa_bf16_mma<Warps, Splits><<<dim3(1024 / (Warps * 8), 2, Splits), Warps * 32, 0, stream>>>(
-+        static_cast<const uint32_t*>(x), static_cast<const uint32_t*>(w),
-+        static_cast<__nv_bfloat16*>(out), static_cast<float*>(partial), m, xt, xg);
-+    cudaError_t error = cudaGetLastError();
-+    if (error != cudaSuccess) return int(error);
-+    if constexpr (Splits > 1) {
-+        const int count = m * 2 * 1024;
-+        woa_mma_reduce<Splits><<<(count + 255) / 256, 256, 0, stream>>>(
-+            static_cast<const float*>(partial), static_cast<__nv_bfloat16*>(out), count);
-+    }
-+    return int(cudaGetLastError());
-+}
-+
-+template<int Warps>
-+int dispatch_mma(void* x, void* w, void* out, void* partial, int m,
-+                 int64_t xt, int64_t xg, int splits, cudaStream_t stream) {
-+    if (splits == 1) return launch_mma<Warps, 1>(x, w, out, partial, m, xt, xg, stream);
-+    if (splits == 2) return launch_mma<Warps, 2>(x, w, out, partial, m, xt, xg, stream);
-+    if (splits == 4) return launch_mma<Warps, 4>(x, w, out, partial, m, xt, xg, stream);
-+    if (splits == 8) return launch_mma<Warps, 8>(x, w, out, partial, m, xt, xg, stream);
-+    if (splits == 16) return launch_mma<Warps, 16>(x, w, out, partial, m, xt, xg, stream);
-+    return int(cudaErrorInvalidValue);
-+}
-+
-+extern "C" int launch_woa(void* x, void* w, void* out, void* partial, int m,
-+        int64_t xt, int64_t xg, int warps, int splits, void* stream) {
-+    if (m < 1 || m > 8 || (xt & 1) || (xg & 1) || xt <= 0 || xg <= 0)
-+        return int(cudaErrorInvalidValue);
-+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-+    if (warps == 4) return dispatch_mma<4>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
-+    if (warps == 8) return dispatch_mma<8>(x, w, out, partial, m, xt, xg, splits, cuda_stream);
-+    return int(cudaErrorInvalidValue);
-+}
---- a/vllm/model_executor/layers/fused_moe/layer.py
-+++ b/vllm/model_executor/layers/fused_moe/layer.py
-@@ -61,6 +61,26 @@
-         sp_size_=sp_size,
-         vllm_parallel_config=parallel_config,
-     )
-+
-+    import os
-+
-+    expert_tp = os.environ.get("VLLM_SM120_EXPERT_TP", "1")
-+    if expert_tp != "1":
-+        if not (
-+            expert_tp in ("2", "4")
-+            and tp_size_ in (4, 8)
-+            and dp_size_ == 1
-+            and pcp_size_ == 1
-+            and moe_parallel_config.use_ep
-+            and not moe_parallel_config.enable_eplb
-+            and moe_parallel_config.all2all_backend == "allgather_reducescatter"
-+        ):
-+            raise ValueError("Unsupported sm120 expert tensor-parallel layout")
-+        transport_rank = moe_parallel_config.ep_rank
-+        moe_parallel_config.tp_size = int(expert_tp)
-+        moe_parallel_config.tp_rank = transport_rank % int(expert_tp)
-+        moe_parallel_config.ep_size //= int(expert_tp)
-+        moe_parallel_config.ep_rank = transport_rank // int(expert_tp)
- 
-     assert moe_parallel_config.is_sequence_parallel == is_sequence_parallel
- 
-@@ -376,6 +396,10 @@
-         skip_final_all_reduce=skip_final_all_reduce,
-     )
- 
-+    import os
-+    if os.environ.get("VLLM_SM120_EXPERT_TP") == "4":
-+        moe_config.tp_shard_with_padding = True
-+
-     logger.debug("FusedMoEConfig = %s", moe_config)
- 
-     # Create RoutedExperts instance BEFORE create_weights()
---- a/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-+++ b/vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py
-@@ -619,25 +619,42 @@
- 
-         if (
-             self._sm120_small_moe
-+            and expert_map is not None
-+            and hidden_states.dtype == torch.float8_e4m3fn
-+            and self.w1_scale.dtype == torch.int32
-+            and self.w2_scale.dtype == torch.int32
-+            and w2.shape == (w1.size(0), 5120, 576)
-+            and activation == MoEActivation.SILU
-+            and not apply_router_weight_on_input
-+            and (
-+                (expert_map.numel() == 384 and w1.shape == (192, 2304, 2560)
-+                 and topk_ids.size(1) == 6 and 96 < hidden_states.size(0) <= 1024)
-+                or (expert_map.numel() == 128 and w1.shape == (64, 2304, 2560)
-+                    and topk_ids.size(1) == 3 and 96 < hidden_states.size(0) <= 512)
-+            )
-+        ):
-+            from vllm.model_executor.layers.fused_moe.experts.sm120_medium_moe import small_moe
-+            small_moe(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
-+                      expert_map, a1q_scale, workspace2)
-+            return
-+
-+        if (
-+            self._sm120_small_moe
-+            and expert_map is not None
-+            and expert_map.numel() == 384
-             and 0 < hidden_states.size(0) <= 96
-             and hidden_states.dtype == torch.float8_e4m3fn
--            and w1.shape[0] in (48, 96)
--            and w1.shape[1:] == (4608, 2560)
--            and w2.shape == (w1.shape[0], 5120, 1152)
-+            and w1.shape == (192, 2304, 2560)
-+            and w2.shape == (192, 5120, 576)
-             and self.w1_scale.dtype == torch.int32
-             and self.w2_scale.dtype == torch.int32
-             and topk_ids.size(1) == 6
-             and activation == MoEActivation.SILU
-             and not apply_router_weight_on_input
-         ):
--            from vllm.model_executor.layers.fused_moe.experts.sm120_small_moe import (
--                small_moe,
--            )
--
--            small_moe(
--                self, output, hidden_states, w1, w2, topk_weights, topk_ids,
--                expert_map, a1q_scale, workspace2,
--            )
-+            from vllm.model_executor.layers.fused_moe.experts.sm120_grouped_moe import small_moe
-+            small_moe(self, output, hidden_states, w1, w2, topk_weights, topk_ids,
-+                      expert_map, a1q_scale, workspace2)
-             return
- 
-         a1q = hidden_states
---- /dev/null
-+++ b/vllm/model_executor/layers/fused_moe/experts/sm120_medium_moe.py
-@@ -0,0 +1,277 @@
-+# SPDX-License-Identifier: Apache-2.0
-+# Copyright (c) 2025 by FlashInfer team.
-+
-+import torch
-+import triton
-+import triton.language as tl
-+from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_q0_route_triton import (
-+    make_mxfp8_q0_route_workspace,
-+)
-+from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.moe_route_meta import (
-+    prefix_cursor_kernel,
-+)
-+from flashinfer.fused_moe.cute_dsl.blackwell_sm12x._moe_utils.sm12x_blockscaled_layout import (
-+    SF_M_ALIGN,
-+)
-+from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_mxfp8_mxfp4_gemm import (
-+    cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
-+)
-+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-+
-+
-+@triton.jit(do_not_specialize=["total_pairs"])
-+def _count_routes_dynamic(
-+    topk_ids, counts, total_pairs, block_n: tl.constexpr
-+):
-+    pair_idx = tl.program_id(0) * block_n + tl.arange(0, block_n)
-+    valid = pair_idx < total_pairs
-+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
-+    tl.atomic_add(counts + expert, 1, mask=expert >= 0, sem="relaxed")
-+
-+@triton.jit(do_not_specialize=["total_pairs"])
-+def _route_assign_dynamic(
-+    topk_ids,
-+    topk_weights,
-+    offsets,
-+    expert_cursor,
-+    token_map,
-+    token_weights,
-+    dst_rows,
-+    scale_dst_rows,
-+    total_pairs,
-+    top_k: tl.constexpr,
-+    scale_align: tl.constexpr,
-+    block_n: tl.constexpr,
-+):
-+    pid = tl.program_id(0)
-+    offs = tl.arange(0, block_n)
-+    pair_idx = pid * block_n + offs
-+    valid = pair_idx < total_pairs
-+    expert = tl.load(topk_ids + pair_idx, mask=valid, other=-1)
-+    # Unrouted (negative id) pairs take no row; see the module docstring.
-+    routed = expert >= 0
-+    routed_row = tl.atomic_add(expert_cursor + expert, 1, mask=routed, sem="relaxed")
-+    token_idx = pair_idx // top_k
-+    expert_begin = tl.load(offsets + expert, mask=routed, other=0)
-+    scale_begin = (expert_begin + expert * (scale_align - 1)) & -scale_align
-+    tl.store(token_map + routed_row, token_idx, mask=routed)
-+    tl.store(
-+        token_weights + routed_row,
-+        tl.load(topk_weights + pair_idx, mask=routed, other=0.0),
-+        mask=routed,
-+    )
-+    tl.store(dst_rows + pair_idx, tl.where(routed, routed_row, -1), mask=valid)
-+    tl.store(
-+        scale_dst_rows + pair_idx,
-+        tl.where(routed, scale_begin + routed_row - expert_begin, -1),
-+        mask=valid,
-+    )
-+
-+@triton.jit(do_not_specialize=["N"])
-+def _map_ids_dynamic(IDS, MAP, LOCAL, N, BLOCK: tl.constexpr):
-+    r = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-+    expert = tl.load(IDS + r, r < N, -1)
-+    local = tl.load(MAP + expert, (r < N) & (expert >= 0), -1)
-+    tl.store(LOCAL + r, local, r < N)
-+
-+
-+@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
-+def _copy_quantized_dynamic(
-+    X,
-+    XS,
-+    DST,
-+    SFDST,
-+    Q,
-+    SF,
-+    K: tl.constexpr,
-+    TOPK: tl.constexpr,
-+    XS0,
-+    XS1,
-+    SF0,
-+    SF1,
-+    PACKED_XS: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+):
-+    route = tl.program_id(0)
-+    block = tl.program_id(1)
-+    token = route // TOPK
-+    dest = tl.load(DST + route)
-+    sfrow = tl.load(SFDST + route)
-+    cols = block * BLOCK + tl.arange(0, BLOCK)
-+    x = tl.load(X + token * K + cols, cols < K, 0)
-+    tl.store(Q + dest * K + cols, x, (cols < K) & (dest >= 0))
-+    for part in tl.static_range(BLOCK // 512):
-+        word = block * (BLOCK // 512) + part
-+        if PACKED_XS:
-+            scale = tl.load(
-+                XS + token * XS0 + word * XS1, word < triton.cdiv(K, 512), 0
-+            )
-+        else:
-+            scale = tl.full((), 0, tl.int32)
-+            for group in tl.static_range(4):
-+                sf = tl.load(
-+                    XS + token * XS0 + (word * 4 + group) * XS1,
-+                    word * 4 + group < triton.cdiv(K, 128),
-+                    0,
-+                )
-+                exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
-+                scale = scale | exponent << group * 8
-+        tl.store(
-+            SF + word * SF0 + sfrow * SF1,
-+            scale,
-+            (word < triton.cdiv(K, 512)) & (dest >= 0),
-+        )
-+
-+
-+@triton.jit(do_not_specialize=["XS0", "XS1", "SF0", "SF1"])
-+def _copy_scales_dynamic(
-+    XS,
-+    DST,
-+    SFDST,
-+    SF,
-+    K: tl.constexpr,
-+    XS0,
-+    XS1,
-+    SF0,
-+    SF1,
-+    PACKED_XS: tl.constexpr,
-+    BLOCK: tl.constexpr,
-+):
-+    route = tl.program_id(0)
-+    source = tl.load(DST + route)
-+    dest = tl.load(SFDST + route)
-+    word = tl.arange(0, BLOCK)
-+    valid = (source >= 0) & (word < triton.cdiv(K, 512))
-+    if PACKED_XS:
-+        scale = tl.load(XS + source * XS0 + word * XS1, valid, 0)
-+    else:
-+        scale = tl.full((BLOCK,), 0, tl.int32)
-+        for group in tl.static_range(4):
-+            sf = tl.load(
-+                XS + source * XS0 + (word * 4 + group) * XS1,
-+                (source >= 0) & (word * 4 + group < triton.cdiv(K, 128)),
-+                0,
-+            )
-+            exponent = sf.to(tl.int32, bitcast=True) >> 23 & 255
-+            scale = scale | exponent << group * 8
-+    tl.store(SF + word * SF0 + dest * SF1, scale, valid)
-+
-+
-+@triton.jit
-+def _reduce(Y, DST, RW, OUT, K: tl.constexpr, TOPK: tl.constexpr, BLOCK: tl.constexpr):
-+    token = tl.program_id(0)
-+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-+    value = tl.full((BLOCK,), 0, tl.float32)
-+    for slot in range(TOPK):
-+        row = tl.load(DST + token * TOPK + slot)
-+        weight = tl.load(RW + token * TOPK + slot)
-+        x = tl.load(Y + row * K + cols, (row >= 0) & (cols < K), 0).to(tl.float32)
-+        value += x * weight
-+    tl.store(OUT + token * K + cols, value, cols < K)
-+
-+
-+def prepare(experts, w1, w2):
-+    source = (experts.w1_scale.data_ptr(), experts.w2_scale.data_ptr())
-+    if getattr(experts, "_sm120_grouped_source", None) != source:
-+        experts._sm120_grouped_scales = (
-+            experts.w1_scale.permute(0, 2, 1).contiguous(),
-+            experts.w2_scale.permute(0, 2, 1).contiguous(),
-+        )
-+        experts._sm120_grouped_source = source
-+
-+
-+_SM120_MEDIUM_SHAPES = set()
-+
-+def small_moe(
-+    experts,
-+    output,
-+    x,
-+    w1,
-+    w2,
-+    weights,
-+    ids,
-+    expert_map,
-+    x_scale,
-+    workspace,
-+    bn=4,
-+    bk=256,
-+):
-+    prepare(experts, w1, w2)
-+    b, ds = experts._sm120_grouped_scales
-+    a, down = (w1, w2)
-+    m, k = x.shape
-+    _SM120_MEDIUM_SHAPES.add((m,w1.shape[0],w1.shape[1]//2,ids.shape[1]))
-+    topk = ids.shape[1]
-+    pairs = ids.numel()
-+    mapped = torch.empty_like(ids)
-+    _map_ids_dynamic[triton.cdiv(pairs,256),](
-+        ids, expert_map, mapped, pairs, 256, num_warps=4
-+    )
-+    route = make_mxfp8_q0_route_workspace(x, mapped, w1.shape[0])
-+    counts = torch.zeros(w1.shape[0], device=x.device, dtype=torch.int32)
-+    cursor = torch.empty_like(counts)
-+    route.scale_out.zero_()
-+    _count_routes_dynamic[triton.cdiv(pairs,256),](
-+        mapped, counts, pairs, 256, num_warps=4,
-+    )
-+    prefix_cursor_kernel[1,](
-+        counts, route.offsets, cursor, w1.shape[0],
-+        triton.next_power_of_2(w1.shape[0]), num_warps=4,
-+    )
-+    _route_assign_dynamic[triton.cdiv(pairs,256),](
-+        mapped, weights, route.offsets, cursor, route.token_map,
-+        route.token_weights, route.dst_rows, route.scale_dst_rows,
-+        pairs, topk, SF_M_ALIGN, 256, num_warps=4,
-+    )
-+    _copy_quantized_dynamic[pairs, triton.cdiv(k, 1024)](
-+        x.view(torch.uint8),
-+        x_scale,
-+        route.dst_rows,
-+        route.scale_dst_rows,
-+        route.q_out.view(torch.uint8),
-+        route.scale_out,
-+        k,
-+        topk,
-+        *x_scale.stride(),
-+        *route.scale_out.stride(),
-+        x_scale.dtype == torch.int32,
-+        1024,
-+        num_warps=4,
-+    )
-+    tile = (max(32, min(128, triton.next_power_of_2(triton.cdiv(pairs, expert_map.numel())))), 128, 128)
-+    projections = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(
-+        route.q_out, route.scale_out, a, b, route.offsets, tile=tile, tune=False
-+    )
-+    intermediate = w1.shape[1] // 2
-+    quantized = torch.empty((pairs, intermediate), device=x.device, dtype=x.dtype)
-+    q, scale = experts._act_mul_quant(projections, quantized, MoEActivation.SILU)
-+    sf2 = torch.zeros(
-+        (triton.cdiv(intermediate, 512), route.scale_out.shape[1]),
-+        device=x.device,
-+        dtype=torch.int32,
-+    )
-+    _copy_scales_dynamic[pairs,](
-+        scale,
-+        route.dst_rows,
-+        route.scale_dst_rows,
-+        sf2,
-+        intermediate,
-+        *scale.stride(),
-+        *sf2.stride(),
-+        scale.dtype == torch.int32,
-+        triton.next_power_of_2(triton.cdiv(intermediate, 512)),
-+        num_warps=4,
-+    )
-+    y = cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4(q, sf2, down, ds, route.offsets, tile=tile, tune=False)
-+    _reduce[m, triton.cdiv(k, 256)](
-+        y,
-+        route.dst_rows,
-+        weights,
-+        output,
-+        k,
-+        topk,
-+        256,
-+        num_warps=4,
-+        enable_fp_fusion=False,
-+    )
-+    return output
