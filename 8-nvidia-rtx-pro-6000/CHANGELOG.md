@@ -4,10 +4,13 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 21. Target vocabulary-parallel sampling
+## 22. Compact TP8 cooperative collectives
 
-- Exchange each vocabulary shard's maximum score and token ID instead of full target logits to reduce communication for eligible greedy requests.
-- Fuse rank reduction, draft verification, and token counts while retaining native sampling for stochastic requests, penalties, logprobs, structured output, and other unsupported modes.
+- Split routed experts across all eight GPUs and use five draft tokens to reduce per-request expert work and reuse target verification.
+- Use direct dense kernels, split gate/up kernels, and 16-lane cooperative host reductions to shorten the measured decode kernels.
+- Use a 3,840-token batching budget and sparse graph coverage through 768 rows to preserve KV capacity while reducing graph padding.
+-    --speculative-config '{"method": "dspark", "num_speculative_tokens": 3, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
+-    --max-num-batched-tokens 4096
 
 Requirements, on a fresh vLLM image:
 
@@ -36,13 +39,15 @@ g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror \
     -I"$vllm_package_dir/../nvidia/nccl/include" \
     "$vllm_package_dir/distributed/nccl_tuner.cc" \
     -o /usr/local/lib/libvllm-sm120-tuner.so
-nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DPACKET_LANES=16 \
     -gencode arch=compute_120a,code=sm_120a \
     "$vllm_package_dir/distributed/device_communicators/sm120_host_all_reduce.cu" \
     -o /usr/local/lib/libvllm-sm120-host-ll.so
 export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
-export VLLM_SM120_EXPERT_TP=2
+export VLLM_SM120_EXPERT_TP=8
+export VLLM_SM120_COMPACT_EXPERTS=1
 export VLLM_SM120_TARGET_GREEDY=1
+export VLLM_SM120_DIRECT_DENSE=1
 ```
 
 Then, run server as:
@@ -57,22 +62,23 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --reasoning-parser deepseek_v41 \
     --mm-encoder-tp-mode data \
     --block-size 64 \
-    --speculative-config '{"method": "dspark", "num_speculative_tokens": 3, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
+    --speculative-config '{"method": "dspark", "num_speculative_tokens": 5, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
     --enable-expert-parallel \
     --gpu-memory-utilization 0.965 \
-    --max-num-batched-tokens 4096
+    --max-num-batched-tokens 3840 \
+    --compilation-config '{"max_cudagraph_capture_size":768,"cudagraph_capture_sizes":[1,2,4,6,8,12,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128,136,144,152,160,168,176,184,192,200,208,216,224,232,240,248,256,272,288,304,320,336,352,368,384,400,416,432,448,464,480,496,512,640,768]}'
 ```
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 232.8 | 131.8 | 5.17 |
-| 4 | 128 | 557.7 | 93.2 | 8.76 |
-| 8 | 128 | 787.1 | 205.4 | 11.55 |
-| 16 | 128 | 1084.7 | 281.8 | 17.55 |
-| 32 | 128 | 1442.4 | 369.7 | 24.77 |
-| 64 | 128 | 1872.9 | 835.6 | 38.33 |
-| 128 | 256 | 2390.4 | 1651.4 | 78.07 |
-| 256 | 512 | 3237.5 | 3052.7 | 119.85 |
+| 1 | 128 | 280.5 | 121.4 | 4.40 |
+| 4 | 128 | 666.0 | 90.0 | 7.49 |
+| 8 | 128 | 879.3 | 149.9 | 11.73 |
+| 16 | 128 | 1141.4 | 285.2 | 16.92 |
+| 32 | 128 | 1537.1 | 412.6 | 24.09 |
+| 64 | 128 | 1964.8 | 913.9 | 36.81 |
+| 128 | 256 | 2460.8 | 1682.0 | 92.90 |
+| 256 | 512 | 3146.5 | 3398.2 | 115.57 |
 
 ## Accepted progress
 
@@ -99,3 +105,4 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 19 | Counter-safe collectives | 211.4 | [`b4be2dd`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/b4be2ddcfaf547f6f042d91aac6a104dfabae3a2) |
 | 20 | Compact two-way experts | 228.9 | [`cf53cb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/cf53cb67cf3f69c26acbbe9afd07ec428d766c60) |
 | 21 | Target vocabulary-parallel sampling | 232.8 | [`7152d0f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/7152d0f13f8aebd75b3f55638f26c270c16b4643) |
+| 22 | Compact TP8 cooperative collectives | 280.5 | This revision |

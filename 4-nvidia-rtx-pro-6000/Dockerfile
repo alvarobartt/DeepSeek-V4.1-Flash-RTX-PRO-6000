@@ -15,7 +15,7 @@ RUN mkdir -p /tmp/nccl-tuner/tuner \
     && g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror -I/tmp/nccl-tuner -I/usr/local/cuda/include -I/usr/local/lib/python3.12/dist-packages/nvidia/nccl/include /usr/local/lib/python3.12/dist-packages/vllm/distributed/nccl_tuner.cc -o /usr/local/lib/libvllm-sm120-tuner.so \
     && rm -r /tmp/nccl-tuner
 
-RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DHOST_RANKS=4 -DPACKET_LANES=16 \
     -gencode arch=compute_120a,code=sm_120a \
     /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/sm120_host_all_reduce.cu \
     -o /usr/local/lib/libvllm-sm120-host-ll.so

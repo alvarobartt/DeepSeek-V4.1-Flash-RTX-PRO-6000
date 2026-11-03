@@ -4,13 +4,11 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 6. Five-draft TP4 experts
+## 7. Cooperative collectives through 64 rows
 
-- Use compact four-way expert shards to split each routed expert across all four GPUs and reduce per-GPU work for a single request.
-- Use five draft tokens, a 4,096-token batching budget, and 768-row graph coverage to improve decode reuse while preserving the original small graph sizes.
-- Use vocabulary-parallel greedy sampling to exchange each rank's best value and token ID while retaining native sampling for other settings.
--    --speculative-config '{"method":"dspark","num_speculative_tokens":3,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true,"use_local_argmax_reduction":true}' \
--    --max-num-batched-tokens 6144
+- Replace the staged host reduction with one cooperative CUDA kernel to remove intermediate launches while retaining system fences and generation checks.
+- Use 16 packet lanes per block and extend the host reduction through 64 rows because those shapes beat NCCL on four GPUs, retaining NCCL for larger messages.
+- Accumulate the new reduction shapes in fixed rank order with FP32 before rounding to BF16, preserving the checkpoint weights and activation precision.
 
 Requirements, on a fresh vLLM image:
 
@@ -39,7 +37,7 @@ g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror \
     -I"$vllm_package_dir/../nvidia/nccl/include" \
     "$vllm_package_dir/distributed/nccl_tuner.cc" \
     -o /usr/local/lib/libvllm-sm120-tuner.so
-nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DHOST_RANKS=4 -DPACKET_LANES=16 \
     -gencode arch=compute_120a,code=sm_120a \
     "$vllm_package_dir/distributed/device_communicators/sm120_host_all_reduce.cu" \
     -o /usr/local/lib/libvllm-sm120-host-ll.so
@@ -74,14 +72,14 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 213.9 | 121.6 | 6.09 |
-| 4 | 128 | 497.5 | 101.0 | 10.01 |
-| 8 | 128 | 683.8 | 158.3 | 14.19 |
-| 16 | 128 | 930.5 | 288.6 | 21.62 |
-| 32 | 128 | 1325.5 | 411.0 | 26.78 |
-| 64 | 128 | 1654.9 | 868.4 | 46.74 |
-| 128 | 256 | 2180.9 | 1702.7 | 79.64 |
-| 256 | 512 | 2782.1 | 3371.6 | 122.90 |
+| 1 | 128 | 216.9 | 119.4 | 5.90 |
+| 4 | 128 | 517.7 | 104.5 | 9.46 |
+| 8 | 128 | 728.1 | 157.6 | 13.14 |
+| 16 | 128 | 976.6 | 295.3 | 19.37 |
+| 32 | 128 | 1340.9 | 416.1 | 26.28 |
+| 64 | 128 | 1661.3 | 763.2 | 42.60 |
+| 128 | 256 | 2219.9 | 1687.9 | 83.72 |
+| 256 | 512 | 2856.3 | 3346.9 | 118.98 |
 
 ## Accepted progress
 
@@ -93,4 +91,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 3 | Four-rank host collectives | 173.8 | [`630b1eb`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/630b1eb24926b2c70072dbe1d0c3a8af4adb4226) |
 | 4 | Grouped BF16 projections | 178.5 | [`253839f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/253839f710753836599f93bdcca65e822f0ac618) |
 | 5 | Aligned TP2 and EP2 experts | 192.2 | [`d0fbce8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/d0fbce80bfdab5115723369ed99b7ee5881d2c99) |
-| 6 | Five-draft TP4 experts | 213.9 | This revision |
+| 6 | Five-draft TP4 experts | 213.9 | [`1520928`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1520928d7a23dbef2399128cb1ec9286d971d93e) |
+| 7 | Cooperative collectives through 64 rows | 216.9 | This revision |
