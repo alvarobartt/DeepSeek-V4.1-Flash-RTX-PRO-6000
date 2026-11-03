@@ -4,13 +4,11 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 22. Compact TP8 cooperative collectives
+## 23. Paired GPU collectives
 
-- Split routed experts across all eight GPUs and use five draft tokens to reduce per-request expert work and reuse target verification.
-- Use direct dense kernels, split gate/up kernels, and 16-lane cooperative host reductions to shorten the measured decode kernels.
-- Use a 3,840-token batching budget and sparse graph coverage through 768 rows to preserve KV capacity while reducing graph padding.
--    --speculative-config '{"method": "dspark", "num_speculative_tokens": 3, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
--    --max-num-batched-tokens 4096
+- Skip publishing the local-owned unreduced chunk because its values are read directly from device memory.
+- Exchange packets with the accessible paired GPU through CUDA IPC to reduce mapped-host traffic while preserving rank-ordered FP32 accumulation and BF16 rounding.
+- Pass each communicator's GPU buffers as launch arguments so another communicator cannot replace its mapping.
 
 Requirements, on a fresh vLLM image:
 
@@ -71,14 +69,22 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 280.5 | 121.4 | 4.40 |
-| 4 | 128 | 666.0 | 90.0 | 7.49 |
-| 8 | 128 | 879.3 | 149.9 | 11.73 |
-| 16 | 128 | 1141.4 | 285.2 | 16.92 |
-| 32 | 128 | 1537.1 | 412.6 | 24.09 |
-| 64 | 128 | 1964.8 | 913.9 | 36.81 |
-| 128 | 256 | 2460.8 | 1682.0 | 92.90 |
-| 256 | 512 | 3146.5 | 3398.2 | 115.57 |
+| 1 | 128 | 284.6 | 122.1 | 4.54 |
+| 4 | 128 | 686.2 | 93.8 | 7.60 |
+| 8 | 128 | 892.9 | 132.8 | 10.75 |
+| 16 | 128 | 1141.3 | 296.2 | 17.11 |
+| 32 | 128 | 1532.2 | 674.3 | 23.78 |
+| 64 | 128 | 1974.3 | 836.4 | 34.95 |
+| 128 | 256 | 2545.0 | 1573.4 | 77.19 |
+| 256 | 512 | 3179.3 | 3379.2 | 122.31 |
+
+The full 1,048,576-token context and 1,024 scheduler slots are retained, with 24,425,790 KV tokens.
+
+All 160 correctness requests and six API checks pass, and all sweep throughput and latency percentiles were independently recomputed.
+
+The Docker recipe builds and reproduces the measured source hashes; GPU benchmarks used matching source overlays on the base image rather than the built image itself.
+
+Against the preceding accepted recipe, c32 p99 TTFT rises by 34.0% and p99 TPOT by 20.1%, while p95 end-to-end latency improves there by 2.9%.
 
 ## Accepted progress
 
@@ -105,4 +111,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 19 | Counter-safe collectives | 211.4 | [`b4be2dd`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/b4be2ddcfaf547f6f042d91aac6a104dfabae3a2) |
 | 20 | Compact two-way experts | 228.9 | [`cf53cb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/cf53cb67cf3f69c26acbbe9afd07ec428d766c60) |
 | 21 | Target vocabulary-parallel sampling | 232.8 | [`7152d0f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/7152d0f13f8aebd75b3f55638f26c270c16b4643) |
-| 22 | Compact TP8 cooperative collectives | 280.5 | This revision |
+| 22 | Compact TP8 cooperative collectives | 280.5 | [`c00f229`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c00f229e9578cea673e1367190ef2b4315b1ed2a) |
+| 23 | Paired GPU collectives | 284.6 | This revision |

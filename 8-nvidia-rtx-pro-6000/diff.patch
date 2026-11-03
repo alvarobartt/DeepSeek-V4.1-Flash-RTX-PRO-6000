@@ -5441,7 +5441,7 @@
              self.pynccl_comm = None
 --- /dev/null
 +++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.cu
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,232 @@
 +#include <cuda_runtime.h>
 +#include <cuda_bf16.h>
 +#include <cooperative_groups.h>
@@ -5492,7 +5492,8 @@
 +
 +__global__ void cooperative_triplet_host(const uint16_t* input, uint16_t* output,
 +                                         uint64_t* shared, uint32_t* counter,
-+                                         int* error, int words, int stride, int rank) {
++                                         int* error, int words, int stride, int rank,
++                                         uint64_t* device_local, const uint64_t* device_peer) {
 +    if (*error) return;
 +    const auto grid = cooperative_groups::this_grid();
 +    const uint32_t epoch = *counter + 1u;
@@ -5503,17 +5504,22 @@
 +    const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
 +    const int global_threads = gridDim.x * blockDim.x;
 +    uint64_t* slot = shared + size_t(epoch & 1u) * Ranks * stride;
++    const int partner = rank ^ 1;
++    uint64_t* local_slot = device_local + size_t(epoch & 1u) * stride;
++    const uint64_t* peer_slot = device_peer + size_t(epoch & 1u) * stride;
 +    const bool boundary = (epoch & 0x7ffeu) == 0;
 +    if (boundary) {
 +        const uint64_t cleared = uint64_t(epoch & 0x8000u) << 48;
 +        for (int i = global_thread; i < stride; i += global_threads) {
 +            uint64_t* address = slot + size_t(rank) * stride + i;
 +            asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(cleared) : "memory");
++            asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(local_slot + i), "l"(cleared) : "memory");
 +        }
 +    }
 +    for (int i = global_thread; i < packets; i += global_threads) {
++        if (i >= rank * chunk && i < min((rank + 1) * chunk, packets)) continue;
 +        const uint64_t value = (uint64_t(tag) << 48) | load_three(input, i, elements);
-+        uint64_t* address = slot + size_t(rank) * stride + i;
++        uint64_t* address = i / chunk == partner ? local_slot + i : slot + size_t(rank) * stride + i;
 +        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(value) : "memory");
 +    }
 +    __threadfence_system();
@@ -5557,7 +5563,7 @@
 +    if (i < end) {
 +        if (peer == rank) value = load_three(input, i, elements);
 +        else {
-+            const uint64_t* address = slot + size_t(peer) * stride + i;
++            const uint64_t* address = peer == partner ? peer_slot + i : slot + size_t(peer) * stride + i;
 +            const uint64_t deadline = clock64() + 180000000000ull;
 +            uint64_t packet;
 +            do {
@@ -5591,13 +5597,14 @@
 +        const uint64_t packet = (uint64_t(tag ^ 0x8000u) << 48) | packed;
 +        uint64_t* address = slot + size_t(rank) * stride + i;
 +        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(address), "l"(packet) : "memory");
++        asm volatile("st.volatile.global.u64 [%0], %1;" :: "l"(local_slot + i), "l"(packet) : "memory");
 +        __threadfence_system();
 +    }
 +    grid.sync();
 +    for (int packet_index = global_thread; packet_index < packets; packet_index += global_threads) {
 +        const int source = packet_index / chunk;
 +        if (source == rank) continue;
-+        const uint64_t* address = slot + size_t(source) * stride + packet_index;
++        const uint64_t* address = source == partner ? peer_slot + packet_index : slot + size_t(source) * stride + packet_index;
 +        const uint64_t consumed_tag = tag ^ 0x8000u;
 +        const uint64_t deadline = clock64() + 180000000000ull;
 +        uint64_t packet;
@@ -5641,18 +5648,35 @@
 +}
 +extern "C" int launch_host_ll(void* input, void* output, void* shared,
 +                              void* counter, void* error, int words, int stride,
-+                              int rank, int threads, void* stream) {
++                              int rank, int threads, void* stream, void* local_mailbox, void* peer_mailbox) {
 +    const int packets = (words * 2 + 2) / 3;
 +    const int chunk = ((packets + Ranks * 32 - 1) / (Ranks * 32)) * 32;
 +    const int blocks = max(1, (chunk + PacketLanes - 1) / PacketLanes);
 +    if (blocks > cooperative_block_limit) return cudaErrorCooperativeLaunchTooLarge;
-+    void* args[] = {&input, &output, &shared, &counter, &error, &words, &stride, &rank};
++    if (!local_mailbox || !peer_mailbox) return cudaErrorInvalidDevicePointer;
++    void* args[] = {&input, &output, &shared, &counter, &error, &words, &stride, &rank, &local_mailbox, &peer_mailbox};
 +    return cudaLaunchCooperativeKernel(reinterpret_cast<void*>(cooperative_triplet_host),
 +        dim3(blocks), dim3(Threads), args, 0, reinterpret_cast<cudaStream_t>(stream));
 +}
++
++extern "C" int allocate_mailbox(size_t bytes, void** pointer) {
++    cudaError_t e = cudaMalloc(pointer, bytes);
++    if (e != cudaSuccess) return e;
++    e = cudaMemset(*pointer, 0, bytes);
++    if (e != cudaSuccess) { cudaFree(*pointer); *pointer = nullptr; }
++    return e;
++}
++extern "C" int export_mailbox(void* pointer, void* handle) {
++    return cudaIpcGetMemHandle(reinterpret_cast<cudaIpcMemHandle_t*>(handle), pointer);
++}
++extern "C" int open_mailbox(void* handle, void** pointer) {
++    return cudaIpcOpenMemHandle(pointer, *reinterpret_cast<cudaIpcMemHandle_t*>(handle), cudaIpcMemLazyEnablePeerAccess);
++}
++extern "C" int close_mailbox(void* pointer) { return cudaIpcCloseMemHandle(pointer); }
++extern "C" int free_mailbox(void* pointer) { return cudaFree(pointer); }
 --- /dev/null
 +++ b/vllm/distributed/device_communicators/sm120_host_all_reduce.py
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,147 @@
 +import ctypes
 +import mmap
 +import os
@@ -5669,6 +5693,7 @@
 +class Sm120HostAllReduce:
 +    def __init__(self, group, device, library=None):
 +        self.disabled = True
++        self.mailboxes_open = False
 +        self.mapping = None
 +        self.device = torch.device(device)
 +        self.rank = dist.get_rank(group)
@@ -5678,6 +5703,15 @@
 +        if not current_platform.is_device_capability_family(120):
 +            return
 +        if not all(in_the_same_node_as(group, source_rank=0)):
++            return
++        devices = [None] * dist.get_world_size(group)
++        dist.all_gather_object(devices, self.device.index, group=group)
++        self.partner = self.rank ^ 1
++        self.peer_device = devices[self.partner]
++        available = bool(torch.cuda.can_device_access_peer(self.device.index, self.peer_device))
++        availability = [None] * len(devices)
++        dist.all_gather_object(availability, available, group=group)
++        if not all(availability):
 +            return
 +        self.lib = ctypes.CDLL(library)
 +        self.lib.register_host.argtypes = [
@@ -5690,7 +5724,7 @@
 +        self.lib.error_text.restype = ctypes.c_char_p
 +        self.lib.prepare_kernel.restype = ctypes.c_int
 +        self.lib.launch_host_ll.argtypes = (
-+            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p]
++            [ctypes.c_void_p] * 5 + [ctypes.c_int] * 4 + [ctypes.c_void_p] * 3
 +        )
 +        self.lib.launch_host_ll.restype = ctypes.c_int
 +        self.max_rows = 16
@@ -5726,6 +5760,7 @@
 +        self.counter = torch.zeros(1, device=self.device, dtype=torch.int32)
 +        self.errors = torch.zeros(8, device=self.device, dtype=torch.int32)
 +        self.check(self.lib.prepare_kernel())
++        self._open_peer_mailboxes(group)
 +        self.disabled = False
 +
 +    def check(self, code):
@@ -5749,16 +5784,46 @@
 +            tensor.data_ptr(), output.data_ptr(), self.mapped.value,
 +            self.counter.data_ptr(), self.errors.data_ptr(), tensor.numel() // 2,
 +            self.stride, self.rank, 128, torch.cuda.current_stream().cuda_stream,
++            self.own_mailbox, self.peer_mailbox,
 +        ))
 +        return output
 +
 +    def destroy(self):
++        if self.mailboxes_open:
++            torch.cuda.synchronize(self.device)
++            dist.barrier(group=self.group)
++            self.check(self.lib.close_mailbox(self.peer_mailbox))
++            dist.barrier(group=self.group)
++            self.check(self.lib.free_mailbox(self.own_mailbox))
++            self.mailboxes_open = False
 +        if self.mapping is not None:
 +            torch.cuda.synchronize(self.device)
 +            self.check(self.lib.unregister_host(self.host))
 +            self.mapping.close()
 +            self.mapping = None
 +        self.disabled = True
++
++    def _open_peer_mailboxes(self, group):
++        self.group = group
++        self.partner = self.rank ^ 1
++        assert torch.cuda.can_device_access_peer(self.device.index, self.peer_device)
++        self.lib.allocate_mailbox.argtypes = [ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
++        self.lib.export_mailbox.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
++        self.lib.open_mailbox.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
++        self.lib.close_mailbox.argtypes = [ctypes.c_void_p]
++        self.lib.free_mailbox.argtypes = [ctypes.c_void_p]
++        self.own_mailbox = ctypes.c_void_p()
++        self.peer_mailbox = ctypes.c_void_p()
++        self.check(self.lib.allocate_mailbox(2 * self.stride * 8, ctypes.byref(self.own_mailbox)))
++        self.handle = ctypes.create_string_buffer(64)
++        self.check(self.lib.export_mailbox(self.own_mailbox, self.handle))
++        handles = [None] * dist.get_world_size(group)
++        dist.all_gather_object(handles, self.handle.raw, group=group)
++        imported = ctypes.create_string_buffer(handles[self.partner], 64)
++        self.check(self.lib.open_mailbox(imported, ctypes.byref(self.peer_mailbox)))
++        dist.barrier(group=group)
++        self.mailboxes_open = True
++
 --- /dev/null
 +++ b/vllm/distributed/nccl_tuner.cc
 @@ -0,0 +1,43 @@
