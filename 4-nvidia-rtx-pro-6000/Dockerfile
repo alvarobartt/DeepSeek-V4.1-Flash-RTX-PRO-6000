@@ -28,3 +28,21 @@ RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
 ENV NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 
 ENV VLLM_SM120_TARGET_GREEDY=1
+
+RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+    -gencode arch=compute_120a,code=sm_120a \
+    /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v4/nvidia/ops/sm120_wo_a_register.cu \
+    -o /usr/local/lib/libvllm-sm120-wo-a-register.so
+
+ENV VLLM_SM120_WOA_REGISTER=1
+
+ENV VLLM_SM120_DIRECT_DENSE=1
+
+ENV OPENBLAS_NUM_THREADS=1 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    RAYON_NUM_THREADS=1 \
+    TOKENIZERS_PARALLELISM=false \
+    TORCHINDUCTOR_COMPILE_THREADS=1 \
+    MAX_JOBS=1

@@ -4,11 +4,12 @@ The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milest
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
-## 8. Paired GPU collectives
+## 9. Direct dense CUDA kernels
 
-- Skip publishing the local-owned unreduced chunk because its values are read directly from device memory.
-- Exchange packets with the accessible paired GPU through CUDA IPC to reduce mapped-host traffic while preserving rank-ordered FP32 accumulation and BF16 rounding.
-- Pass each communicator's GPU buffers as launch arguments so another communicator cannot replace its mapping.
+- Use direct FP8 kernels for small QKV and shared-expert projections to reduce projection latency.
+- Use BF16 register MMA for five through eight WO-A rows while retaining the existing smaller-row kernel and original weights.
+- Limit BLAS and compiler thread pools to one to reproduce the matched measurements and avoid thread exhaustion.
+- Retain the preceding serve arguments, full context, and scheduler capacity to isolate the kernel changes.
 
 Requirements, on a fresh vLLM image:
 
@@ -49,6 +50,14 @@ export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 export VLLM_SM120_EXPERT_TP=4
 export VLLM_SM120_COMPACT_EXPERTS=1
 export VLLM_SM120_TARGET_GREEDY=1
+nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
+    -gencode arch=compute_120a,code=sm_120a \
+    "$vllm_package_dir/models/deepseek_v4/nvidia/ops/sm120_wo_a_register.cu" \
+    -o /usr/local/lib/libvllm-sm120-wo-a-register.so
+export VLLM_SM120_DIRECT_DENSE=1
+export VLLM_SM120_WOA_REGISTER=1
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+export RAYON_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false TORCHINDUCTOR_COMPILE_THREADS=1 MAX_JOBS=1
 ```
 
 Then, run server as:
@@ -72,14 +81,24 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 
 | Concurrency | Prompts | Output t/s | p95 TTFT (ms) | p95 TPOT (ms) |
 |---:|---:|---:|---:|---:|
-| 1 | 128 | 224.0 | 118.8 | 5.72 |
-| 4 | 128 | 541.5 | 98.3 | 9.36 |
-| 8 | 128 | 751.9 | 198.0 | 13.01 |
-| 16 | 128 | 1016.7 | 284.5 | 18.88 |
-| 32 | 128 | 1363.5 | 414.4 | 27.81 |
-| 64 | 128 | 1689.9 | 886.0 | 43.73 |
-| 128 | 256 | 2227.3 | 1741.0 | 83.76 |
-| 256 | 512 | 2865.2 | 3314.6 | 118.56 |
+| 1 | 128 | 231.3 | 118.5 | 5.25 |
+| 4 | 128 | 534.4 | 100.0 | 9.20 |
+| 8 | 128 | 752.1 | 153.3 | 13.45 |
+| 16 | 128 | 1018.1 | 279.7 | 19.43 |
+| 32 | 128 | 1363.1 | 677.1 | 28.03 |
+| 64 | 128 | 1666.3 | 854.7 | 46.81 |
+| 128 | 256 | 2241.0 | 1732.4 | 84.52 |
+| 256 | 512 | 2882.4 | 3298.9 | 121.63 |
+
+The full 1,048,576-token context and 1,024 scheduler slots are retained, with 3,115,530 KV tokens.
+
+All 160 correctness requests and six API checks pass, and all sweep throughput and latency percentiles were independently recomputed.
+
+The Docker recipe builds and reproduces the measured source hashes; GPU benchmarks used matching source overlays on the base image rather than the built image itself.
+
+Against the matched control, c1 improves by 5.2%, c32 and c64 throughput change by -0.3% and -0.5%, and c4 p99 TPOT rises from 10.0 to 12.0 ms; reversed cache-matched c32 repeats show comparable median tails.
+
+KV capacity falls from 3,116,608 to 3,115,530 tokens while retaining the full context and scheduler limits.
 
 ## Accepted progress
 
@@ -93,4 +112,5 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
 | 5 | Aligned TP2 and EP2 experts | 192.2 | [`d0fbce8`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/d0fbce80bfdab5115723369ed99b7ee5881d2c99) |
 | 6 | Five-draft TP4 experts | 213.9 | [`1520928`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1520928d7a23dbef2399128cb1ec9286d971d93e) |
 | 7 | Cooperative collectives through 64 rows | 216.9 | [`c00f229`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c00f229e9578cea673e1367190ef2b4315b1ed2a) |
-| 8 | Paired GPU collectives | 224.0 | This revision |
+| 8 | Paired GPU collectives | 224.0 | [`1122ce0`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1122ce0fc4b811d1e1c22dd96d2b760f17c25901) |
+| 9 | Direct dense CUDA kernels | 231.3 | This revision |

@@ -112,4 +112,4 @@ Against the preceding accepted recipe, c32 p99 TTFT rises by 34.0% and p99 TPOT 
 | 20 | Compact two-way experts | 228.9 | [`cf53cb6`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/cf53cb67cf3f69c26acbbe9afd07ec428d766c60) |
 | 21 | Target vocabulary-parallel sampling | 232.8 | [`7152d0f`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/7152d0f13f8aebd75b3f55638f26c270c16b4643) |
 | 22 | Compact TP8 cooperative collectives | 280.5 | [`c00f229`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c00f229e9578cea673e1367190ef2b4315b1ed2a) |
-| 23 | Paired GPU collectives | 284.6 | This revision |
+| 23 | Paired GPU collectives | 284.6 | [`1122ce0`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1122ce0fc4b811d1e1c22dd96d2b760f17c25901) |
