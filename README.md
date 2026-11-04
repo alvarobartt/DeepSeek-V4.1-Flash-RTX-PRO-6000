@@ -7,9 +7,8 @@
     <tr><td>Architecture</td><td>sm120</td></tr>
     <tr><td>Precision</td><td>BF16 activations with native FP8 and MXFP4 weights</td></tr>
     <tr><td>Image</td><td><code>vllm/vllm-openai:v0.32.0</code></td></tr>
+    <tr><td>Container</td><td><a href="https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/pkgs/container/vllm"><code>ghcr.io/alvarobartt/vllm:0.32.0-ds4.1-sm120</code></a></td></tr>
 </table>
-
-Validated serving recipes for four and eight GPUs, using the checkpoint's original weights and precision.
 
 ## 8 x NVIDIA RTX PRO 6000
 
@@ -48,20 +47,6 @@ See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rt
 ![ShareGPT throughput by concurrency](4-nvidia-rtx-pro-6000/concurrency.png)
 
 See the detailed changelog in [`4-nvidia-rtx-pro-6000/CHANGELOG.md`](4-nvidia-rtx-pro-6000/CHANGELOG.md).
-
-Run the requirements and full `vllm serve` command in the hardware changelog; each directory also includes a Dockerfile that retains the image's default entrypoint without model or parallelism defaults.
-
-Apply the documented environment exports inside the serving environment, including when launching a container.
-
-Measurements use `vllm bench serve` with ShareGPT, seed 0, temperature 0, dataset output lengths, and matching-concurrency warmups, with 128 measured prompts through c64, 256 at c128, and 512 at c256.
-
-`benchmark.py` only sends benchmark requests to an existing server; run `python benchmark.py --help` for its model, dataset, endpoint, and output options.
-
-Throughput is aggregate generated output tokens per second, including reasoning tokens; results depend on prompt lengths, cache state, and concurrency.
-
-The measured model revision retains a 1,048,576-token context and 1,024 scheduler slots; the ShareGPT sweep does not measure performance at the full context length.
-
-The recipes target this model, sm120 hardware, and vLLM version; the [Apache 2.0 license](LICENSE) covers this repository, and model weights retain their upstream terms.
 
 [^8gpu-baseline]: Baseline uses sm120 compatibility fixes, FlashInfer 0.7.1, and `--block-size 64`; stock vLLM failed before inference.
 [^4gpu-baseline]: Baseline includes sm120 compatibility fixes, native FP8 KV-cache handling, grouped FP4 experts, and expert parallelism with DSpark disabled; the DSpark reference adds three adaptive draft tokens.

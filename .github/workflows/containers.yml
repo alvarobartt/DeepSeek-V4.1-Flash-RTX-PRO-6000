@@ -1,0 +1,95 @@
+name: Publish containers
+
+on:
+    push:
+        branches: [main]
+        paths:
+            - .github/workflows/containers.yml
+            - .dockerignore
+            - Dockerfile
+            - diff.patch
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: containers-${{ github.ref }}
+    cancel-in-progress: false
+
+jobs:
+    publish:
+        name: Publish sm120 image
+        runs-on: ubuntu-24.04
+        timeout-minutes: 90
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - name: Check out repository
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  persist-credentials: false
+
+            - name: Free space for the vLLM image
+              run: |
+                  df -h
+                  sudo rm -rf \
+                      /usr/share/dotnet /usr/local/lib/android /opt/ghc "$RUNNER_TOOL_CACHE" \
+                      /usr/local/share/powershell /usr/share/swift /usr/lib/jvm \
+                      /usr/local/share/boost /usr/local/lib/node_modules /opt/az /opt/google /opt/microsoft
+                  docker image prune --all --force
+                  df -h
+
+            - name: Set image tags
+              id: image
+              shell: bash
+              run: |
+                  version=$(sed -n 's|^FROM vllm/vllm-openai:v\([^[:space:]]*\)$|\1|p' Dockerfile)
+                  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+                  image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/vllm"
+                  tag="$version-ds4.1-sm120"
+                  echo "name=$image" >> "$GITHUB_OUTPUT"
+                  echo "tag=$tag" >> "$GITHUB_OUTPUT"
+                  echo "commit_tag=$tag-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+            - name: Log in to GHCR
+              uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build and publish
+              id: build
+              uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+              env:
+                  DOCKER_BUILD_RECORD_UPLOAD: false
+              with:
+                  context: .
+                  file: Dockerfile
+                  platforms: linux/amd64
+                  push: true
+                  tags: |
+                      ${{ steps.image.outputs.name }}:${{ steps.image.outputs.tag }}
+                      ${{ steps.image.outputs.name }}:${{ steps.image.outputs.commit_tag }}
+                  labels: |
+                      org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+                      org.opencontainers.image.revision=${{ github.sha }}
+                      org.opencontainers.image.version=${{ steps.image.outputs.tag }}
+                      org.opencontainers.image.description=DeepSeek-V4.1-Flash-1017 on NVIDIA RTX PRO 6000 GPUs with TP4 or TP8
+
+            - name: Verify published image
+              env:
+                  IMAGE: ${{ steps.image.outputs.name }}
+                  TAG: ${{ steps.image.outputs.tag }}
+                  COMMIT_TAG: ${{ steps.image.outputs.commit_tag }}
+                  DIGEST: ${{ steps.build.outputs.digest }}
+              run: |
+                  test "$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{.Manifest.Digest}}')" = "$DIGEST"
+                  test "$(docker buildx imagetools inspect "$IMAGE:$COMMIT_TAG" --format '{{.Manifest.Digest}}')" = "$DIGEST"
+                  echo "### $IMAGE:$TAG" >> "$GITHUB_STEP_SUMMARY"
+                  echo "\`docker pull $IMAGE@$DIGEST\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,10 +1,10 @@
 FROM vllm/vllm-openai:v0.32.0
 
-RUN python3 -m pip install --no-deps --upgrade flashinfer-python==0.7.1 \
-    && python3 -m pip install --no-deps --upgrade flashinfer-cubin==0.7.1 --index-url https://flashinfer.ai/whl \
-    && python3 -m pip install --no-deps --upgrade flashinfer-jit-cache==0.7.1 flashinfer-jit-cache-sm120f==0.7.1 --index-url https://flashinfer.ai/whl/cu130
+RUN python3 -m pip install --no-cache-dir --no-deps --upgrade flashinfer-python==0.7.1 \
+    && python3 -m pip install --no-cache-dir --no-deps --upgrade flashinfer-cubin==0.7.1 --index-url https://flashinfer.ai/whl \
+    && python3 -m pip install --no-cache-dir --no-deps --upgrade flashinfer-jit-cache==0.7.1 flashinfer-jit-cache-sm120f==0.7.1 --index-url https://flashinfer.ai/whl/cu130
 
-COPY 4-nvidia-rtx-pro-6000/diff.patch /tmp/diff.patch
+COPY diff.patch /tmp/diff.patch
 RUN patch --batch --forward -p1 -d /usr/local/lib/python3.12/dist-packages < /tmp/diff.patch \
     && rm /tmp/diff.patch
 
@@ -15,10 +15,12 @@ RUN mkdir -p /tmp/nccl-tuner/tuner \
     && g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror -I/tmp/nccl-tuner -I/usr/local/cuda/include -I/usr/local/lib/python3.12/dist-packages/nvidia/nccl/include /usr/local/lib/python3.12/dist-packages/vllm/distributed/nccl_tuner.cc -o /usr/local/lib/libvllm-sm120-tuner.so \
     && rm -r /tmp/nccl-tuner
 
-RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DHOST_RANKS=4 -DPACKET_LANES=16 \
+RUN set -eu; for ranks in 4 8; do \
+    nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DHOST_RANKS=$ranks -DPACKET_LANES=16 \
     -gencode arch=compute_120a,code=sm_120a \
     /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/sm120_host_all_reduce.cu \
-    -o /usr/local/lib/libvllm-sm120-host-ll.so
+    -o /usr/local/lib/libvllm-sm120-host-ll-tp$ranks.so; \
+    done
 
 RUN nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared \
     -gencode arch=compute_120a,code=sm_120a \

@@ -1,6 +1,6 @@
 # 8 x NVIDIA RTX PRO 6000
 
-The patch is cumulative against `vllm/vllm-openai:v0.32.0`; every working milestone contains its complete recipe.
+The shared [patch](../diff.patch) is cumulative against `vllm/vllm-openai:v0.32.0` and selects kernels for TP4 and TP8 at runtime.
 
 FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support, and both the sm120 compatibility patch and `--block-size 64` are required.
 
@@ -10,42 +10,11 @@ FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support,
 - Exchange packets with the accessible paired GPU through CUDA IPC to reduce mapped-host traffic while preserving rank-ordered FP32 accumulation and BF16 rounding.
 - Pass each communicator's GPU buffers as launch arguments so another communicator cannot replace its mapping.
 
-Requirements, on a fresh vLLM image:
+Requirements: see the shared [Dockerfile](../Dockerfile).
 
 ```bash
-python3 -m pip install --no-deps --upgrade \
-    flashinfer-python==0.7.1
-python3 -m pip install --no-deps --upgrade \
-    flashinfer-cubin==0.7.1 \
-    --index-url https://flashinfer.ai/whl
-python3 -m pip install --no-deps --upgrade \
-    flashinfer-jit-cache==0.7.1 \
-    flashinfer-jit-cache-sm120f==0.7.1 \
-    --index-url https://flashinfer.ai/whl/cu130
-vllm_package_dir=$(python3 -c 'import importlib.util; print(importlib.util.find_spec("vllm").submodule_search_locations[0])')
-patch --batch --forward -p1 -d "$vllm_package_dir/.." < 8-nvidia-rtx-pro-6000/diff.patch
-nccl_headers=https://raw.githubusercontent.com/NVIDIA/nccl/73cf112295c33aee2b895f329f592f2a9b4b0f97/src/include
-mkdir -p /tmp/nccl-tuner/tuner
-curl -fL "$nccl_headers/plugin/nccl_tuner.h" -o /tmp/nccl-tuner/nccl_tuner.h
-curl -fL "$nccl_headers/nccl_common.h" -o /tmp/nccl-tuner/nccl_common.h
-for nccl_api in 2 3 4 5 6; do
-    curl -fL "$nccl_headers/plugin/tuner/tuner_v${nccl_api}.h" -o "/tmp/nccl-tuner/tuner/tuner_v${nccl_api}.h"
-done
-g++ -std=c++17 -O3 -shared -fPIC -Wall -Wextra -Werror \
-    -I/tmp/nccl-tuner \
-    -I/usr/local/cuda/include \
-    -I"$vllm_package_dir/../nvidia/nccl/include" \
-    "$vllm_package_dir/distributed/nccl_tuner.cc" \
-    -o /usr/local/lib/libvllm-sm120-tuner.so
-nvcc -O3 -std=c++17 -shared -Xcompiler=-fPIC --cudart shared -rdc=true -DPACKET_LANES=16 \
-    -gencode arch=compute_120a,code=sm_120a \
-    "$vllm_package_dir/distributed/device_communicators/sm120_host_all_reduce.cu" \
-    -o /usr/local/lib/libvllm-sm120-host-ll.so
-export NCCL_TUNER_PLUGIN=/usr/local/lib/libvllm-sm120-tuner.so
 export VLLM_SM120_EXPERT_TP=8
 export VLLM_SM120_COMPACT_EXPERTS=1
-export VLLM_SM120_TARGET_GREEDY=1
-export VLLM_SM120_DIRECT_DENSE=1
 ```
 
 Then, run server as:
@@ -82,9 +51,11 @@ The full 1,048,576-token context and 1,024 scheduler slots are retained, with 24
 
 All 160 correctness requests and six API checks pass, and all sweep throughput and latency percentiles were independently recomputed.
 
-The Docker recipe builds and reproduces the measured source hashes; GPU benchmarks used matching source overlays on the base image rather than the built image itself.
+The CUDA kernels are unchanged in the shared recipe; GPU measurements use source overlays on the base image, and the built image is separately checked for matching source hashes and compiled libraries.
 
 Against the preceding accepted recipe, c32 p99 TTFT rises by 34.0% and p99 TPOT by 20.1%, while p95 end-to-end latency improves there by 2.9%.
+
+The table records the linked accepted milestone, and the shared recipe also passes a fresh full concurrency sweep, 160 correctness requests, six API fallback checks, and original-weight checks on TP8.
 
 ## Accepted progress
 
