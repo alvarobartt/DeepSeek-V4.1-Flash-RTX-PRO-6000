@@ -15,7 +15,7 @@ Validated serving recipes for four and eight GPUs, using the checkpoint's origin
 
 | Concurrency | Baseline t/s [^8gpu-baseline] | Baseline + DSpark t/s | Current t/s |
 |---:|---:|---:|---:|
-| 1 | 85.0 | 159.2 (+87.3%) | **284.6 (+78.8%)** |
+| 1 | 85.0 | 159.2 (+87.3%) | **284.6 (+78.7%)** |
 | 4 | 253.2 | 380.4 (+50.2%) | **686.2 (+80.4%)** |
 | 8 | 375.4 | 496.2 (+32.2%) | **892.9 (+79.9%)** |
 | 16 | 553.1 | 650.5 (+17.6%) | **1141.3 (+75.4%)** |
@@ -34,13 +34,13 @@ See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rt
 
 | Concurrency | Baseline t/s [^4gpu-baseline] | Baseline + DSpark t/s | Current t/s |
 |---:|---:|---:|---:|
-| 1 | 68.9 | 131.3 (+90.6%) | **231.3 (+76.2%)** |
-| 4 | 216.8 | 305.4 (+40.9%) | **534.4 (+75.0%)** |
+| 1 | 68.9 | 131.3 (+90.8%) | **231.3 (+76.2%)** |
+| 4 | 216.8 | 305.4 (+40.8%) | **534.4 (+75.0%)** |
 | 8 | 317.3 | 450.0 (+41.8%) | **752.1 (+67.1%)** |
 | 16 | 425.8 | 646.7 (+51.9%) | **1018.1 (+57.4%)** |
 | 32 | 553.8 | 929.3 (+67.8%) | **1363.1 (+46.7%)** |
 | 64 | 735.3 | 1216.4 (+65.4%) | **1666.3 (+37.0%)** |
-| 128 | 1147.5 | 1779.2 (+55.1%) | **2241.0 (+26.0%)** |
+| 128 | 1147.5 | 1779.2 (+55.0%) | **2241.0 (+26.0%)** |
 | 256 | 1683.6 | 2090.1 (+24.1%) | **2882.4 (+37.9%)** |
 
 ![Accepted ShareGPT c1 throughput](4-nvidia-rtx-pro-6000/throughput.png)
@@ -50,6 +50,8 @@ See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rt
 See the detailed changelog in [`4-nvidia-rtx-pro-6000/CHANGELOG.md`](4-nvidia-rtx-pro-6000/CHANGELOG.md).
 
 Run the requirements and full `vllm serve` command in the hardware changelog; each directory also includes a Dockerfile that retains the image's default entrypoint without model or parallelism defaults.
+
+Apply the documented environment exports inside the serving environment, including when launching a container.
 
 Measurements use `vllm bench serve` with ShareGPT, seed 0, temperature 0, dataset output lengths, and matching-concurrency warmups, with 128 measured prompts through c64, 256 at c128, and 512 at c256.
 

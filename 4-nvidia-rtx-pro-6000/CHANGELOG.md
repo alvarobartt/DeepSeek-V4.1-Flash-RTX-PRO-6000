@@ -113,4 +113,4 @@ KV capacity falls from 3,116,608 to 3,115,530 tokens while retaining the full co
 | 6 | Five-draft TP4 experts | 213.9 | [`1520928`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1520928d7a23dbef2399128cb1ec9286d971d93e) |
 | 7 | Cooperative collectives through 64 rows | 216.9 | [`c00f229`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/c00f229e9578cea673e1367190ef2b4315b1ed2a) |
 | 8 | Paired GPU collectives | 224.0 | [`1122ce0`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/1122ce0fc4b811d1e1c22dd96d2b760f17c25901) |
-| 9 | Direct dense CUDA kernels | 231.3 | This revision |
+| 9 | Direct dense CUDA kernels | 231.3 | [`d1c2707`](https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/tree/d1c270705af2829bae98ff9aa9e48980a9e941b4) |

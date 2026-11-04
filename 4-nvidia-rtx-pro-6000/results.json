@@ -1,0 +1,148 @@
+{
+  "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "hardware": "4 x NVIDIA RTX PRO 6000 (96 GB)",
+  "image": "vllm/vllm-openai:v0.32.0",
+  "stage": "Direct dense CUDA kernels",
+  "dataset": "anon8231489123/ShareGPT_Vicuna_unfiltered",
+  "dataset_file": "ShareGPT_V3_unfiltered_cleaned_split.json",
+  "dataset_revision": "192ab2185289094fc556ec8ce5ce1e8e587154ca",
+  "seed": 0,
+  "temperature": 0,
+  "output_lengths": "dataset",
+  "warmup_requests": "matching concurrency",
+  "precision": "BF16 activations with native FP8 and MXFP4 weights",
+  "max_model_len": 1048576,
+  "max_num_seqs": 1024,
+  "KV_tokens": 3115530,
+  "c1_repeats": [
+    231.28765073000443,
+    231.522188631434,
+    231.01706407602398
+  ],
+  "metrics": {
+    "1": {
+      "output_throughput": 231.28765073000443,
+      "p95_tpot_ms": 5.25020357245051,
+      "p99_tpot_ms": 6.16995860171191,
+      "p95_ttft_ms": 118.46813157899304,
+      "p99_ttft_ms": 126.37659262050876,
+      "p95_e2el_ms": 2446.671460766811,
+      "p99_e2el_ms": 3184.1586045397003,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27939
+    },
+    "4": {
+      "output_throughput": 534.3754829595164,
+      "p95_tpot_ms": 9.195794239775465,
+      "p99_tpot_ms": 11.97997652870923,
+      "p95_ttft_ms": 100.03471269155851,
+      "p99_ttft_ms": 111.39419690589422,
+      "p95_e2el_ms": 4206.39303450007,
+      "p99_e2el_ms": 5424.013601738264,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27942
+    },
+    "8": {
+      "output_throughput": 752.1237779346623,
+      "p95_tpot_ms": 13.454745024117935,
+      "p99_tpot_ms": 14.948708756627251,
+      "p95_ttft_ms": 153.34417335689042,
+      "p99_ttft_ms": 163.90601956634782,
+      "p95_e2el_ms": 5792.135356768266,
+      "p99_e2el_ms": 6913.341017256028,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27779
+    },
+    "16": {
+      "output_throughput": 1018.1075888124303,
+      "p95_tpot_ms": 19.430643600173337,
+      "p99_tpot_ms": 21.585986287746994,
+      "p95_ttft_ms": 279.6721495105885,
+      "p99_ttft_ms": 280.32414665911347,
+      "p95_e2el_ms": 8367.17360473121,
+      "p99_e2el_ms": 10943.7316571991,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27940
+    },
+    "32": {
+      "output_throughput": 1363.0628468282591,
+      "p95_tpot_ms": 28.02562730699812,
+      "p99_tpot_ms": 53.25435507675261,
+      "p95_ttft_ms": 677.1428858162835,
+      "p99_ttft_ms": 678.0490077135619,
+      "p95_e2el_ms": 10787.178599293107,
+      "p99_e2el_ms": 13284.947184406921,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27942
+    },
+    "64": {
+      "output_throughput": 1666.295379882778,
+      "p95_tpot_ms": 46.81064406489598,
+      "p99_tpot_ms": 55.4574913465019,
+      "p95_ttft_ms": 854.7073339519557,
+      "p99_ttft_ms": 857.3472393548582,
+      "p95_e2el_ms": 13490.34419007366,
+      "p99_e2el_ms": 14741.995275748197,
+      "completed": 128,
+      "failed": 0,
+      "total_output_tokens": 27934
+    },
+    "128": {
+      "output_throughput": 2240.994563252596,
+      "p95_tpot_ms": 84.51864751820852,
+      "p99_tpot_ms": 119.47576443864295,
+      "p95_ttft_ms": 1732.4196541740093,
+      "p99_ttft_ms": 1735.4039800527971,
+      "p95_e2el_ms": 21806.71854747925,
+      "p99_e2el_ms": 23503.150713647476,
+      "completed": 256,
+      "failed": 0,
+      "total_output_tokens": 55449
+    },
+    "256": {
+      "output_throughput": 2882.4345433957324,
+      "p95_tpot_ms": 121.63199293616343,
+      "p99_tpot_ms": 159.30607538345996,
+      "p95_ttft_ms": 3298.9213973341975,
+      "p99_ttft_ms": 3588.583878449863,
+      "p95_e2el_ms": 31555.910418508574,
+      "p99_e2el_ms": 35813.33580611506,
+      "completed": 512,
+      "failed": 0,
+      "total_output_tokens": 111259
+    }
+  },
+  "warm_c128_repeats": [
+    {
+      "output_throughput": 2315.488653483182,
+      "p95_tpot_ms": 73.14534060534915,
+      "p99_tpot_ms": 124.69673240557294,
+      "p95_ttft_ms": 1679.6165605192073,
+      "p99_ttft_ms": 1686.4552318351343,
+      "p95_e2el_ms": 20496.841879037675,
+      "p99_e2el_ms": 22412.066972302266,
+      "completed": 256,
+      "failed": 0,
+      "total_output_tokens": 55230
+    },
+    {
+      "output_throughput": 2253.289019442091,
+      "p95_tpot_ms": 78.10487012045894,
+      "p99_tpot_ms": 127.30971484755477,
+      "p95_ttft_ms": 1633.1269252696075,
+      "p99_ttft_ms": 1843.5375642497092,
+      "p95_e2el_ms": 20051.135225221515,
+      "p99_e2el_ms": 22688.671619270455,
+      "completed": 256,
+      "failed": 0,
+      "total_output_tokens": 55264
+    }
+  ],
+  "patch_sha256": "be42b47f22e5c655597cf15e6dfdda9a665282d3cf23469fcbbb5e0a3bb303ca"
+}
