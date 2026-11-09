@@ -12,10 +12,6 @@
 
 Benchmark commands and comparisons are in [`benchmarks/`](benchmarks/).
 
-The throughput comparisons use temperature 0; see the [output-quality checks](benchmarks/quality/) and temperature-1 [LocalMaxxing results](benchmarks/localmaxxing/#results).
-
-For AgentX c8, set `--gpu-memory-utilization 0.95` to reserve prefill workspace.
-
 ## 8 x NVIDIA RTX PRO 6000
 
 ```bash
