@@ -10,12 +10,7 @@ FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support,
 - Exchange packets with the accessible paired GPU through CUDA IPC to reduce mapped-host traffic while preserving rank-ordered FP32 accumulation and BF16 rounding.
 - Pass each communicator's GPU buffers as launch arguments so another communicator cannot replace its mapping.
 
-Requirements: see the shared [Dockerfile](../Dockerfile).
-
-```bash
-export VLLM_SM120_EXPERT_TP=8
-export VLLM_SM120_COMPACT_EXPERTS=1
-```
+For a native installation, complete the dependency installation, patching, kernel compilation, and environment setup in the shared [Dockerfile](../Dockerfile) before running the command below.
 
 Then, run server as:
 
@@ -24,6 +19,7 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
     --tokenizer-mode deepseek_v41 \
     --tensor-parallel-size 8 \
+    --max-model-len 1048576 \
     --tool-call-parser deepseek_v41 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v41 \

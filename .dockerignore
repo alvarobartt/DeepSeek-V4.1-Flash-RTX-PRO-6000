@@ -3,3 +3,5 @@
 __pycache__
 **/*.png
 **/results.json
+.cache/
+results/

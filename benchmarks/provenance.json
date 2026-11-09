@@ -1,0 +1,408 @@
+{
+    "date": "2026-11-05",
+    "model": {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170"
+    },
+    "recipes": {
+        "baseline_mtp_4_gpu": "dee02d3567a50684bf4abb462d28390b3c3c9460",
+        "baseline_mtp_8_gpu": "e5ac344074d1e9141c50e3178cde4e2a3680da8b",
+        "optimized": "a1c8a45a431e3b8779fba255be16ccf3fecb6d94"
+    },
+    "optimized_image": "ghcr.io/alvarobartt/vllm@sha256:11fd738a193ce4e97cc36f64b9f6d4eddb45d731179ac42099966a7d8ec2bb7e",
+    "optimized_patch_sha256": "7632fb966dd714ffd0a6ca7ad3ba4e2ea8b5b99129176858be29bd1d387c1baa",
+    "clients": {
+        "aiperf": {
+            "version": "0.13.0",
+            "commit": "794f8bb75f8582f22e412d7e650fc71ca2a3d21a"
+        },
+        "agentx-harness": {
+            "version": "1.0.13",
+            "commit": "60a094f256b42f55fde1efb3d45672e1d9a44566"
+        },
+        "llm-inference-bench": {
+            "version": "0.8.0",
+            "commit": "52216d70865a015b34689626d04a80b89c9dc45f"
+        },
+        "localmaxxing-cli": {
+            "version": "0.1.60",
+            "commit": "f02df4ae88e3bf8b1fbf6fca767bb96c032f2a34"
+        }
+    },
+    "datasets": {
+        "sharegpt": {
+            "id": "anon8231489123/ShareGPT_Vicuna_unfiltered",
+            "revision": "192ab2185289094fc556ec8ce5ce1e8e587154ca",
+            "file_sha256": "35f0e213ce091ed9b9af2a1f0755e9d39f9ccec34ab281cd4ca60d70f6479ba4"
+        },
+        "agentx": {
+            "alias": "semianalysis_cc_traces_weka_062126",
+            "revision": "23f152f6f0f9399a85901b89a6458def0ef16729",
+            "id": "semianalysisai/cc-traces-weka-062126"
+        }
+    },
+    "retests": [
+        {
+            "tool": "aiperf",
+            "gpu_count": 4,
+            "concurrency": 32,
+            "profiles": [
+                "baseline-mtp",
+                "optimized"
+            ],
+            "connection_reuse_strategy": "never",
+            "reason": "Rerun both recipes on one matched lease after an original client connection reset."
+        },
+        {
+            "tool": "agentx",
+            "gpu_counts": [
+                4,
+                8
+            ],
+            "concurrency": 8,
+            "profiles": [
+                "baseline-mtp",
+                "optimized"
+            ],
+            "optimized_gpu_memory_utilization": 0.95,
+            "reason": "Rerun matched pairs with prefill workspace headroom after original optimized c8 warmups ran out of GPU memory."
+        }
+    ],
+    "client_python": "3.12",
+    "extended_localmaxxing": {
+        "date": "2026-11-05",
+        "server_commit": "889b538fc5098835454a5e592492c80db0fe3102",
+        "image": "ghcr.io/alvarobartt/vllm@sha256:ebdd9351069705b01e49d3fe080a427729c5680c5fd87d13c7fef163d041838a",
+        "gpu_memory_utilization": 0.95,
+        "decode_context_targets": [
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            262144,
+            524288,
+            1043456
+        ],
+        "concurrencies": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128
+        ],
+        "prefill_context_targets": [
+            8192,
+            16384,
+            32768,
+            65536,
+            131072,
+            262144,
+            524288,
+            1043456,
+            1048512
+        ],
+        "decode_seconds_per_cell": 30,
+        "prefill_seconds_per_point": 30,
+        "decode_output_limit": 4096,
+        "client_version": "0.8.0+prefill-window",
+        "client_source_commit": "52216d70865a015b34689626d04a80b89c9dc45f",
+        "client_patch": "llm-inference-bench/prefill.patch",
+        "client_patched_sha256": "2a7a05ee3d23ace06f756a542eba1edd211c0dc0b036823360600376c15160fd",
+        "speed_test": {
+            "prompt": "code-v1",
+            "warmups": 2,
+            "samples": 5,
+            "max_output_tokens": 8192
+        },
+        "publication_adjustments": [
+            "Preview limited to 4000 characters.",
+            "Equivalent flat hardware metadata preserves GPU count.",
+            "Actual server command and tensor parallel size attached from launch records."
+        ],
+        "reports": {
+            "speed_4": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw41h11z0c35oa017fybo2gp",
+            "matrix_4": "https://www.localmaxxing.com/en/inference-benchmarks/cmw41hm250c39oa01nud4y8yd",
+            "speed_8": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw41hmdv0c5doa010rsncwkq",
+            "matrix_8": "https://www.localmaxxing.com/en/inference-benchmarks/cmw41hn3g0c5goa01z8a4ylt4"
+        }
+    },
+    "quality_audit": {
+        "date": "2026-11-05",
+        "optimized_commit": "889b538fc5098835454a5e592492c80db0fe3102",
+        "reference_commit": "e5ac344074d1e9141c50e3178cde4e2a3680da8b",
+        "image": "ghcr.io/alvarobartt/vllm@sha256:ebdd9351069705b01e49d3fe080a427729c5680c5fd87d13c7fef163d041838a",
+        "seed": 42,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "concurrency": 8,
+        "gpu_memory_utilization": 0.95,
+        "gsm8k": {
+            "repository": "openai/grade-school-math",
+            "commit": "3101c7d5072418e28b9008a6636bde82a006892c",
+            "split": "test",
+            "samples": 128,
+            "selection": "First 128 indices sorted by SHA256 bytes of deepseek-sm120-quality-audit-v2:{index}.",
+            "prompt_suffix": "\nGive your final answer as #### <number>.",
+            "reasoning_effort": 50,
+            "max_tokens": 8192
+        },
+        "humaneval": {
+            "repository": "openai/human-eval",
+            "commit": "b9453e8f1865df0a0057a1383767caa400acfbcf",
+            "samples": 164,
+            "thinking": false,
+            "max_tokens": 8192,
+            "prompt_prefix": "Complete the Python function below. Return the complete implementation, including its signature and any imports, in one Python code block.\n\n",
+            "grading": "Execute official tests against the complete returned function and imports, with a 10-second test timeout."
+        },
+        "producer_release_scores_reproduced": false,
+        "results": [
+            {
+                "role": "reference",
+                "gpus": 8,
+                "dspark": true,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 124,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 159,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            },
+            {
+                "role": "reference",
+                "gpus": 8,
+                "dspark": false,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 126,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 157,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            },
+            {
+                "role": "current",
+                "gpus": 8,
+                "dspark": true,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 125,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 155,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            },
+            {
+                "role": "current",
+                "gpus": 8,
+                "dspark": false,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 124,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 158,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            },
+            {
+                "role": "four",
+                "gpus": 4,
+                "dspark": true,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 125,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 155,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            },
+            {
+                "role": "four",
+                "gpus": 4,
+                "dspark": false,
+                "gsm8k": {
+                    "count": 128,
+                    "correct": 125,
+                    "truncated": 0,
+                    "empty_final": 0,
+                    "loops": 0
+                },
+                "humaneval": {
+                    "count": 164,
+                    "correct": 159,
+                    "truncated": 0,
+                    "empty_final": 0
+                }
+            }
+        ]
+    },
+    "quality_checked_localmaxxing": {
+        "date": "2026-11-05",
+        "image": "ghcr.io/alvarobartt/vllm@sha256:ebdd9351069705b01e49d3fe080a427729c5680c5fd87d13c7fef163d041838a",
+        "server_commit": "889b538fc5098835454a5e592492c80db0fe3102",
+        "gpu_memory_utilization": 0.95,
+        "temperature": 1,
+        "top_p": 1,
+        "canonical_prompt": "code-v1",
+        "warmups": 2,
+        "timed_samples": 5,
+        "max_output_tokens": 262144,
+        "functional_cases_per_program": 8,
+        "all_programs_passed": true,
+        "rates_include_reasoning": true,
+        "producer_release_scores_reproduced": false,
+        "reports": {
+            "4": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw46xlzn0c7noa01juy6dphq",
+            "8": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw46xxjz0c7qoa015tqhf9um"
+        },
+        "runs": [
+            {
+                "gpu_count": 4,
+                "median_decode_tps": 238.5,
+                "median_ttft_ms": 77.26,
+                "timed_output_tokens": [
+                    10520,
+                    11017,
+                    9841,
+                    6826,
+                    8605
+                ]
+            },
+            {
+                "gpu_count": 8,
+                "median_decode_tps": 334.4,
+                "median_ttft_ms": 64.09,
+                "timed_output_tokens": [
+                    9063,
+                    8763,
+                    9096,
+                    8815,
+                    6655
+                ]
+            }
+        ]
+    },
+    "sampling_audited_localmaxxing": {
+        "date": "2026-11-06",
+        "server_commit": "889b538fc5098835454a5e592492c80db0fe3102",
+        "image": "ghcr.io/alvarobartt/vllm@sha256:ebdd9351069705b01e49d3fe080a427729c5680c5fd87d13c7fef163d041838a",
+        "max_model_len": 1048576,
+        "default_context_verified_before_pinning": true,
+        "gpu_memory_utilization": 0.95,
+        "temperature": 1,
+        "top_p": 1,
+        "top_k": 0,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "repetition_penalty": 1,
+        "max_tokens": 262144,
+        "warmups": 2,
+        "timed_samples": 5,
+        "effective_sampling_audited_requests_per_run": 7,
+        "code_functional_cases_per_program": 8,
+        "code_programs_passed": 14,
+        "code_cases_passed": 112,
+        "reasoning_review": "Four-part completion and arithmetic checked; pooled versus equal-share battery interpretations accepted; not a formal benchmark score.",
+        "matrix_rerun": false,
+        "reports": {
+            "4": {
+                "code-v1": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw4r18p00c8qoa017nckg5bb",
+                "reasoning-v1": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw4r18y60c8toa01xt1zu44m"
+            },
+            "8": {
+                "code-v1": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw4r19730c8woa01mw67rblr",
+                "reasoning-v1": "https://www.localmaxxing.com/en/models/deepseek-ai/DeepSeek-V4.1-Flash-1017?run=cmw4r19k30c8zoa01ltcmcoco"
+            }
+        },
+        "runs": [
+            {
+                "gpu_count": 4,
+                "canonical_prompt": "code-v1",
+                "median_tps": 268.2,
+                "median_ttft_ms": 74.93,
+                "timed_output_tokens": [
+                    7190,
+                    4729,
+                    11576,
+                    7705,
+                    12827
+                ]
+            },
+            {
+                "gpu_count": 4,
+                "canonical_prompt": "reasoning-v1",
+                "median_tps": 208,
+                "median_ttft_ms": 80.97,
+                "timed_output_tokens": [
+                    6073,
+                    6288,
+                    7734,
+                    5240,
+                    8158
+                ]
+            },
+            {
+                "gpu_count": 8,
+                "canonical_prompt": "code-v1",
+                "median_tps": 340.7,
+                "median_ttft_ms": 60.73,
+                "timed_output_tokens": [
+                    11676,
+                    11680,
+                    8799,
+                    8743,
+                    7696
+                ]
+            },
+            {
+                "gpu_count": 8,
+                "canonical_prompt": "reasoning-v1",
+                "median_tps": 266.7,
+                "median_ttft_ms": 70.62,
+                "timed_output_tokens": [
+                    5910,
+                    6104,
+                    4727,
+                    4998,
+                    2010
+                ]
+            }
+        ]
+    }
+}
