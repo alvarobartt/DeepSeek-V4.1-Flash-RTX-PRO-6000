@@ -13,6 +13,7 @@ def main():
     parser.add_argument("--tokenizer")
     parser.add_argument("--tokenizer-mode", default="auto")
     parser.add_argument("--num-prompts", type=int)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 4, 8, 16, 32, 64, 128, 256])
     args = parser.parse_args()
     if not args.dataset.is_file():
@@ -38,7 +39,7 @@ def main():
             "--dataset-name", "sharegpt", "--dataset-path", str(args.dataset),
             "--num-prompts", str(num_prompts), "--seed", "0",
             "--max-concurrency", str(concurrency), "--request-rate", "inf",
-            "--num-warmups", str(concurrency), "--temperature", "0",
+            "--num-warmups", str(concurrency), "--temperature", str(args.temperature),
             "--percentile-metrics", "ttft,tpot,itl,e2el", "--metric-percentiles", "50,95,99",
             "--save-result", "--save-detailed", "--disable-tqdm",
             "--result-dir", str(args.output), "--result-filename", f"c{concurrency}.json",

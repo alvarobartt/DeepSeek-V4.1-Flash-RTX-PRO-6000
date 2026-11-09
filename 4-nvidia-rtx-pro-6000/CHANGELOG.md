@@ -11,12 +11,7 @@ FlashInfer 0.7.1 replaces the bundled 0.7.0.post1 for runtime page-size support,
 - Limit BLAS and compiler thread pools to one to reproduce the matched measurements and avoid thread exhaustion.
 - Retain the preceding serve arguments, full context, and scheduler capacity to isolate the kernel changes.
 
-Requirements: see the shared [Dockerfile](../Dockerfile).
-
-```bash
-export VLLM_SM120_EXPERT_TP=4
-export VLLM_SM120_COMPACT_EXPERTS=1
-```
+For a native installation, complete the dependency installation, patching, kernel compilation, and environment setup in the shared [Dockerfile](../Dockerfile) before running the command below.
 
 Then, run server as:
 
@@ -25,6 +20,7 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash-1017 \
     --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
     --tokenizer-mode deepseek_v41 \
     --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
     --tool-call-parser deepseek_v41 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v41 \

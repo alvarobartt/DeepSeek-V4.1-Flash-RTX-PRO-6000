@@ -7,10 +7,50 @@
     <tr><td>Architecture</td><td>sm120</td></tr>
     <tr><td>Precision</td><td>BF16 activations with native FP8 and MXFP4 weights</td></tr>
     <tr><td>Image</td><td><code>vllm/vllm-openai:v0.32.0</code></td></tr>
-    <tr><td>Container</td><td><a href="https://github.com/alvarobartt/DeepSeek-V4.1-Flash-RTX-PRO-6000/pkgs/container/vllm"><code>ghcr.io/alvarobartt/vllm:0.32.0-ds4.1-sm120</code></a></td></tr>
+    <tr><td>Container</td><td><a href="https://github.com/users/alvarobartt/packages/container/package/vllm"><code>ghcr.io/alvarobartt/vllm:0.32.0-ds4.1-sm120</code></a></td></tr>
 </table>
 
+Benchmark commands and comparisons are in [`benchmarks/`](benchmarks/).
+
+The throughput comparisons use temperature 0; see the [output-quality checks](benchmarks/quality/) and temperature-1 [LocalMaxxing results](benchmarks/localmaxxing/#results).
+
+For AgentX c8, set `--gpu-memory-utilization 0.95` to reserve prefill workspace.
+
 ## 8 x NVIDIA RTX PRO 6000
+
+```bash
+docker run --rm \
+    --gpus 8 \
+    --network host \
+    --ipc host \
+    --ulimit memlock=-1 \
+    -v "${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface" \
+    -e HF_TOKEN \
+    ghcr.io/alvarobartt/vllm:0.32.0-ds4.1-sm120 \
+    deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+    --tokenizer-mode deepseek_v41 \
+    --tensor-parallel-size 8 \
+    --max-model-len 1048576 \
+    --tool-call-parser deepseek_v41 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v41 \
+    --mm-encoder-tp-mode data \
+    --block-size 64 \
+    --speculative-config '{"method": "dspark", "num_speculative_tokens": 5, "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170", "enable_adaptive_verification": true, "use_local_argmax_reduction": true}' \
+    --enable-expert-parallel \
+    --gpu-memory-utilization 0.965 \
+    --max-num-batched-tokens 3840 \
+    --compilation-config '{
+        "max_cudagraph_capture_size": 768,
+        "cudagraph_capture_sizes": [
+            1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88,
+            96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216,
+            224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432,
+            448, 464, 480, 496, 512, 640, 768
+        ]
+    }'
+```
 
 | Concurrency | Baseline t/s [^8gpu-baseline] | Baseline + DSpark t/s | Current t/s |
 |---:|---:|---:|---:|
@@ -30,6 +70,41 @@
 See the detailed changelog in [`8-nvidia-rtx-pro-6000/CHANGELOG.md`](8-nvidia-rtx-pro-6000/CHANGELOG.md).
 
 ## 4 x NVIDIA RTX PRO 6000
+
+```bash
+docker run --rm \
+    --gpus 4 \
+    --network host \
+    --ipc host \
+    --ulimit memlock=-1 \
+    -v "${HF_HOME:-$HOME/.cache/huggingface}:/root/.cache/huggingface" \
+    -e HF_TOKEN \
+    ghcr.io/alvarobartt/vllm:0.32.0-ds4.1-sm120 \
+    deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+    --revision 1bae0e1088993b9b82de08f59de5be5a34e42170 \
+    --tokenizer-mode deepseek_v41 \
+    --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
+    --tool-call-parser deepseek_v41 \
+    --enable-auto-tool-choice \
+    --reasoning-parser deepseek_v41 \
+    --mm-encoder-tp-mode data \
+    --block-size 64 \
+    --enable-expert-parallel \
+    --speculative-config '{"method":"dspark","num_speculative_tokens":5,"revision":"1bae0e1088993b9b82de08f59de5be5a34e42170","enable_adaptive_verification":true,"use_local_argmax_reduction":true}' \
+    --gpu-memory-utilization 0.97 \
+    --max-num-batched-tokens 4096 \
+    --compilation-config '{
+        "max_cudagraph_capture_size": 768,
+        "cudagraph_capture_sizes": [
+            1, 2, 4, 6, 8, 12, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88,
+            96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216,
+            224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432,
+            448, 464, 480, 496, 512, 528, 544, 560, 576, 592, 608, 624, 640, 656, 672, 688,
+            704, 720, 736, 752, 768
+        ]
+    }'
+```
 
 | Concurrency | Baseline t/s [^4gpu-baseline] | Baseline + DSpark t/s | Current t/s |
 |---:|---:|---:|---:|

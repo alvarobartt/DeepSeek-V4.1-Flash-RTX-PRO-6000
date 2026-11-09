@@ -1,0 +1,20 @@
+--- a/llm_decode_bench.py
++++ b/llm_decode_bench.py
+@@ -71,7 +71,7 @@
+ # Constants
+ # ---------------------------------------------------------------------------
+ 
+-VERSION = "0.8.0"
++VERSION = "0.8.0+prefill-window"
+ 
+ # Bumped whenever the answer extraction / scoring rules change in a way that can
+ # move a pass/fail verdict. Recorded in result metadata so old and new reports
+@@ -15753,7 +15753,7 @@
+     # The old repeated cold-prefill phase remains available for focused ingest
+     # profiling with --standalone-prefill.
+     PREFILL_CANDIDATES = [parse_token_value(x) for x in args.prefill_contexts.split(",") if x.strip()]
+-    max_prefill = min(131072, server_context_length - 64) if server_context_length > 0 else 131072
++    max_prefill = server_context_length - 64 if server_context_length > 0 else 131072
+     decode_prefill_contexts = [c for c in context_lengths if c > 0 and c <= max_prefill]
+     requested_standalone_prefill_contexts = [c for c in PREFILL_CANDIDATES if c <= max_prefill]
+     standalone_prefill_contexts = requested_standalone_prefill_contexts if args.standalone_prefill else []
